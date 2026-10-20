@@ -1,0 +1,88 @@
+# Example configuration for synop_maps.py
+# Copy this file, edit it, then:  python3 synop_maps.py submit my_config.yaml
+
+name: CONVX2_APT_waves_10m_wind_test            # used for job names and the default workdir
+# workdir: /scratch/$USER/synop_maps/my_comparison   # default: ./runs/<name>
+
+# Forecast base dates/times (MARS style lists or ranges are fine)
+# dates: 20240601/to/20240622/by/1
+# Or several named periods instead of `dates`; each gets its own statistics and
+# is selectable on the same page (colour scales are shared between periods):
+periods:
+  DJF: 20241201/to/20241231/by/1
+  JJA: 20240601/to/20240622/by/1
+times: [0, 12]
+steps: 24/to/240/by/24
+
+# Parameters (MARS names as understood by vino_genfc / vino_getgeo).
+# Accumulated / extreme parameters need a period in hours; steps shorter than
+# the period are skipped automatically.
+parameters:
+  - param: 2t
+  - param: 10ff
+  # - param: msl
+  # - param: tp
+  #   period: 24
+
+# Experiments. The FIRST one is the reference for difference maps.
+#   upload: true   -> missing dates are pushed to VINO with vino_genfc
+#   upload: false  -> data is assumed to be in VINO already (e.g. operations)
+# With `periods`, any experiment setting (expver, stream, upload, ...) can be
+# given per period while the label stays the same, e.g.
+#   - label: myexp
+#     expver: {DJF: abcd, JJA: efgh}
+experiments:
+  - label: 50r1
+    class: rd
+    stream: lwda
+    expver: j5mc
+    type: fc
+    anoffset: 9
+    upload: false
+  - label: CONVX2_APT_waves_10m_wind
+    class: rd
+    stream: lwda           # lwda for experiments run with the long window DA
+    expver: jc0k
+    type: fc
+    anoffset: 9          # needed for stream lwda
+    upload: false
+  # - label: CONVX2
+  #   class: rd
+  #   stream: lwda
+  #   expver: jbkp
+  #   anoffset: 9
+  #   type: fc
+  #   upload: false
+
+sources: [synop]               # VINO observation sources
+interpolation: nearest_point   # nearest_point | nearest_land_point | nearest_sea_point
+chunk_size: 15                 # dates per vino_genfc / vino_getgeo call
+parallel: 4                    # concurrent vino_genfc / vino_getgeo calls
+
+genfc:
+  ignore_missing: false         # skip dates missing in MARS instead of failing
+  get_orog_once: true
+  extra_args: []               # any other vino_genfc arguments, e.g. ["--grid", "0.1/0.1"]
+
+plot:
+  regions:                     # name: [west, east, south, north] or null for global
+    global: null
+    europe: [-25, 45, 33, 72]
+  min_fraction: 0.5            # station needs valid pairs for >= this fraction of forecasts
+  daily_maps: false            # also draw maps for every single forecast (many images!)
+  processes: 4                 # used when not running under slurm
+  dpi: 150
+  lapse_rate: 0.0065           # K/m, corrects 2t forecasts to station height (0 = off)
+  max_dz: 250                  # m, exclude stations with |model - station elevation| > this (null = off)
+
+publish:                       # upload index.html + plots after the plot stage
+  site: https://sites.ecmwf.int/pavn/spatial_maps/   # null = do not publish
+  # path: my_folder             # folder on the site, default: the run name
+  token_file: ~/.spatial_maps_sites
+
+slurm:
+  qos: np
+  # account: myproject
+  upload:   {time: "24:00:00", mem: 16G, cpus: 4}
+  download: {time: "12:00:00", mem: 16G, cpus: 4}
+  plot:     {time: "06:00:00", mem: 32G, cpus: 4}

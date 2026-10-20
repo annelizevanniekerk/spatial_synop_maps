@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__ – SYNOP maps</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #5f6878;
+    --line: #dde1e8; --accent: #2457c5; --good: #1f6fb2; --bad: #c0392b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #15181e; --panel: #1e222a; --text: #e6e9ef; --muted: #9aa3b2;
+            --line: #2e3440; --accent: #7aa2ff; --good: #6aaef0; --bad: #ff7b6b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+         background: var(--bg); color: var(--text); }
+  header { position: sticky; top: 0; z-index: 2; background: var(--panel);
+           border-bottom: 1px solid var(--line); padding: 10px 16px; }
+  h1 { font-size: 16px; margin: 0 0 8px; }
+  h1 small { color: var(--muted); font-weight: normal; margin-left: 8px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: end; }
+  label { display: flex; flex-direction: column; font-size: 12px; color: var(--muted); gap: 2px; }
+  select, button { font: inherit; color: var(--text); background: var(--bg);
+                   border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  .step { display: flex; gap: 4px; align-items: center; }
+  .step input { width: 200px; accent-color: var(--accent); }
+  .step output { min-width: 56px; font-variant-numeric: tabular-nums; color: var(--text); }
+  main { padding: 16px; max-width: 2400px; margin: 0 auto; }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(520px, 1fr)); }
+  figure { margin: 0; background: var(--panel); border: 1px solid var(--line);
+           border-radius: 8px; padding: 8px; }
+  figure img { width: 100%; height: auto; display: block; background: #fff; border-radius: 4px; }
+  figcaption { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .missing { padding: 40px; text-align: center; color: var(--muted); }
+  table { border-collapse: collapse; margin-top: 16px; background: var(--panel);
+          border: 1px solid var(--line); border-radius: 8px; font-variant-numeric: tabular-nums; }
+  th, td { padding: 5px 12px; border-bottom: 1px solid var(--line); text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  td.better { color: var(--good); font-weight: 600; }
+  td.worse { color: var(--bad); font-weight: 600; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } .step input { width: 120px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title"></h1>
+  <div class="controls">
+    <label id="periodBox">Period <select id="period"></select></label>
+    <label>Parameter <select id="param"></select></label>
+    <label>Region <select id="region"></select></label>
+    <label>View <select id="view"></select></label>
+    <label id="baseBox">Forecast base <select id="base"></select></label>
+    <label>Forecast step
+      <span class="step">
+        <button id="prev" title="previous step (←)">◀</button>
+        <input type="range" id="step" min="0" value="0">
+        <button id="next" title="next step (→)">▶</button>
+        <output id="stepOut"></output>
+      </span>
+    </label>
+  </div>
+</header>
+<main>
+  <div class="grid" id="figs"></div>
+  <div id="table"></div>
+  <p class="note" id="note"></p>
+</main>
+<script>
+const M = __MANIFEST__;
+const $ = id => document.getElementById(id);
+const pad3 = s => String(s).padStart(3, "0");
+const EXPS = M.experiments, REF = M.reference, OTHERS = EXPS.slice(1);
+
+const VIEWS = [
+  ["bias", "Bias (fc − obs)", EXPS],
+  ["rmse", "RMSE", EXPS],
+  ["mae", "MAE", EXPS],
+  ["rmsediff", `RMSE difference vs ${REF}`, OTHERS],
+  ["maediff", `MAE difference vs ${REF}`, OTHERS],
+  ["rmserel", `Relative RMSE change vs ${REF} (%)`, OTHERS],
+  ["scores", "Scores vs step", null],
+  ["daily", "Single forecasts", null],
+].filter(v => v[2] === null || v[2].length);
+
+$("title").innerHTML = `${M.title}<small>experiments: ${EXPS.join(", ")} · reference: ${REF} · generated ${M.generated}</small>`;
+
+function fill(sel, items, keep) {
+  const prev = keep ?? sel.value;
+  sel.innerHTML = items.map(([v, t]) => `<option value="${v}">${t}</option>`).join("");
+  if (items.some(([v]) => String(v) === String(prev))) sel.value = prev;
+}
+
+const state = Object.fromEntries(new URLSearchParams(location.hash.slice(1)));
+
+const PERIODS = Object.keys(M.periods);
+function params() { return M.periods[$("period").value]?.params ?? {}; }
+function regionInfo() { return params()[$("param").value]?.regions[$("region").value]; }
+function steps() { return regionInfo()?.steps ?? []; }
+function step() { return steps()[+$("step").value]; }
+
+function refreshControls() {
+  fill($("period"), PERIODS.map(k => [k, `${k} (${M.periods[k].dates})`]), state.period);
+  $("periodBox").style.display = PERIODS.length > 1 ? "" : "none";
+  fill($("param"), Object.entries(params()).map(([k, p]) => [k, p.label]), state.param);
+  const p = params()[$("param").value];
+  if (!p) { $("figs").innerHTML = '<div class="missing">No data plotted yet.</div>'; return false; }
+  fill($("region"), Object.keys(p.regions).map(r => [r, r]), state.region);
+  const views = VIEWS.filter(v => v[0] !== "daily" || regionInfo().daily.length);
+  fill($("view"), views.map(([v, t]) => [v, t]), state.view);
+  const daily = regionInfo().daily;
+  fill($("base"), daily.map(b => [b, `${b.slice(0,4)}-${b.slice(4,6)}-${b.slice(6,8)} ${b.slice(8)}z`]), state.base);
+  $("baseBox").style.display = $("view").value === "daily" ? "" : "none";
+  const st = steps();
+  $("step").max = Math.max(0, st.length - 1);
+  if (state.step !== undefined) {
+    const i = st.indexOf(+state.step);
+    if (i >= 0) $("step").value = i;
+  }
+  $("step").value = Math.min(+$("step").value, st.length - 1);
+  return true;
+}
+
+function fig(src, caption) {
+  return `<figure><figcaption>${caption}</figcaption>
+    <img src="${src}" loading="lazy" alt="${caption}"
+      onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'missing',textContent:'not available'}))"></figure>`;
+}
+
+function render() {
+  if (!refreshControls()) return;
+  const key = $("param").value, region = $("region").value, view = $("view").value, s = step();
+  Object.assign(state, { period: $("period").value, param: key, region, view, step: s, base: $("base").value });
+  history.replaceState(null, "", "#" + new URLSearchParams(state));
+  $("stepOut").textContent = `T+${s}h`;
+  const per = $("period").value;
+  const dir = `plots/${per}/${key}/${region}`, p = params()[key];
+  let html = "";
+  if (view === "scores") {
+    html = fig(`${dir}/scores.png`, `${p.label} – all steps`);
+  } else if (view === "daily") {
+    const b = $("base").value;
+    html = fig(`${dir}/daily/${b}/obs_T${pad3(s)}.png`, "Observations")
+      + EXPS.map(e => fig(`${dir}/daily/${b}/err_${e}_T${pad3(s)}.png`, `${e} error`)).join("");
+  } else {
+    const exps = VIEWS.find(v => v[0] === view)[2];
+    html = exps.map(e => fig(`${dir}/${view}_${e}_T${pad3(s)}.png`,
+      view.endsWith("diff") ? `${e} − ${REF}` : view === "rmserel" ? `${e} vs ${REF}` : e)).join("");
+  }
+  $("figs").innerHTML = html;
+  renderTable(p, s);
+  $("note").textContent = `${M.metrics[view] ?? ""}  Statistics use only station/forecast pairs available for every experiment. Keyboard: ← → change step.`;
+}
+
+function renderTable(p, s) {
+  const sc = regionInfo().scores[s];
+  if (!sc) { $("table").innerHTML = ""; return; }
+  const units = p.units ? ` [${p.units}]` : "";
+  const rows = EXPS.map(e => {
+    const cells = ["bias", "rmse", "mae"].map(m => {
+      const v = sc[e][m], r = sc[REF][m];
+      let cls = "";
+      if (e !== REF && m !== "bias") cls = v < r ? "better" : v > r ? "worse" : "";
+      if (e !== REF && m === "bias") cls = Math.abs(v) < Math.abs(r) ? "better" : Math.abs(v) > Math.abs(r) ? "worse" : "";
+      return `<td class="${cls}">${v.toFixed(3)}</td>`;
+    }).join("");
+    const rel = 100 * (sc[e].rmse / sc[REF].rmse - 1);
+    const relCell = e === REF ? "<td>–</td>"
+      : `<td class="${rel < 0 ? "better" : rel > 0 ? "worse" : ""}">${rel > 0 ? "+" : ""}${rel.toFixed(2)} %</td>`;
+    return `<tr><td>${e}${e === REF ? " (ref)" : ""}</td>${cells}${relCell}</tr>`;
+  }).join("");
+  $("table").innerHTML = `<table><thead><tr><th>T+${s}h · ${sc.n} pairs · ${sc.stations} stations</th>
+    <th>Bias${units}</th><th>RMSE${units}</th><th>MAE${units}</th><th>RMSE vs ${REF}</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function move(d) {
+  const v = Math.min(Math.max(+$("step").value + d, 0), steps().length - 1);
+  state.step = steps()[v]; render();
+}
+["period", "param", "region", "view", "base"].forEach(id => $(id).addEventListener("change", () => { state[id] = $(id).value; render(); }));
+$("step").addEventListener("input", () => { state.step = steps()[+$("step").value]; render(); });
+$("prev").onclick = () => move(-1);
+$("next").onclick = () => move(1);
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "SELECT") return;
+  if (e.key === "ArrowLeft") move(-1);
+  if (e.key === "ArrowRight") move(1);
+});
+render();
+</script>
+</body>
+</html>
