@@ -198,6 +198,8 @@ uploaded or downloaded; observations still come from VINO through
 
 * Selectors for parameter, region, view (Bias / RMSE / MAE / RMSE difference /
   MAE difference / Relative RMSE change / Model − station height / Scores vs step / Single forecasts) and forecast step.
+  With ensembles there are also Fair CRPS / FCRPS difference / Relative FCRPS
+  change views, and FCRPS columns in the table.
   Use the slider, the ◀ ▶ buttons or the ← → keys to change the step.
 * All experiments are shown side by side. Below the maps, a table gives the
   bias, RMSE, MAE and relative RMSE change for the current step: green is
@@ -246,9 +248,7 @@ collocate_<exp3>  ────────────────────�
 
 ## Notes and limitations
 
-* Only deterministic forecasts are supported (`type: fc`, `cf`, ...).
-  `vino_getgeo` has no `--numbers` option, so perturbed ENS members can't be
-  read back per member.
+* Without `control: true` an ensemble is only its perturbed members (`type: pf`).
 * The units are whatever VINO stores (for example tp in mm and tcc in %).
   Forecasts and observations come from VINO in the same units.
 * The upload check reads only the first and the last step. A date where a
@@ -272,6 +272,40 @@ The pipeline was tested with operational data that is already in VINO:
 
 `vino_genfc` itself (the actual upload) has not been run yet: that needs one
 of your experiments.
+
+## Ensembles (fair CRPS)
+
+An experiment with `type: pf` is an ensemble. Give its members with `numbers`
+(passed to `vino_genfc --numbers`):
+
+```yaml
+  - {label: ctl, class: rd, stream: enfo, expver: j5me, type: pf, numbers: 1/to/8}
+```
+
+Both `collocate: vino` and `local` work: `vino_genfc` and `vino_getgeo` put all
+members of one forecast in one geopoint file (columns `value_0 ... value_<n-1>`).
+`numbers` is part of the store directory name, so different member sets don't
+mix.
+
+`control: true` adds the control forecast (`type: cf`, same class/stream/expver)
+as one more member. It is uploaded/collocated and downloaded as a data set of its
+own, and a forecast is used only when both its pf and its cf files are there.
+
+* Per pair, the fair CRPS (Ferro 2014) is
+  `mean_i |x_i - y| - sum_{i<j} |x_i - x_j| / (m (m - 1))` over the m members.
+  Unlike the plain CRPS it does not favour ensembles with more members.
+  Station FCRPS is the mean over the forecasts, and the regional score the mean
+  over the stations.
+* The maps `fcrps_<exp>`, `fcrpsdiff_<exp>` (minus the reference) and `fcrpsrel_<exp>`
+  (`100 * (FCRPS_exp / FCRPS_ref - 1)`, i.e. minus the CRPSS against the reference)
+  are drawn, and `scores.png` gets FCRPS panels.
+  These views appear only when the config has at least one ensemble.
+* Bias, RMSE and MAE of an ensemble are of the ensemble mean.
+* A deterministic experiment can be compared with ensembles: its CRPS is its
+  absolute error.
+* The height correction is applied to every member. A station is used only
+  when all of its members are valid.
+* For `10dd` the differences are angular and the ensemble mean is the circular mean.
 
 ## Publishing on sites.ecmwf.int
 

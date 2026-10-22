@@ -75,6 +75,7 @@ const M = __MANIFEST__;
 const $ = id => document.getElementById(id);
 const pad3 = s => String(s).padStart(3, "0");
 const EXPS = M.experiments, REF = M.reference, OTHERS = EXPS.slice(1);
+const ENS = "fcrps" in M.metrics;  // ensemble experiments: fair CRPS views
 
 const VIEWS = [
   ["bias", "Bias (fc − obs)", EXPS],
@@ -83,6 +84,11 @@ const VIEWS = [
   ["rmsediff", `RMSE difference vs ${REF}`, OTHERS],
   ["maediff", `MAE difference vs ${REF}`, OTHERS],
   ["rmserel", `Relative RMSE change vs ${REF} (%)`, OTHERS],
+  ...(ENS ? [
+    ["fcrps", "Fair CRPS", EXPS],
+    ["fcrpsdiff", `FCRPS difference vs ${REF}`, OTHERS],
+    ["fcrpsrel", `Relative FCRPS change vs ${REF} (%)`, OTHERS],
+  ] : []),
   ["orog", "Model − station height", null],
   ["scores", "Scores vs step", null],
   ["daily", "Single forecasts", null],
@@ -153,7 +159,7 @@ function render() {
   } else {
     const exps = VIEWS.find(v => v[0] === view)[2];
     html = exps.map(e => fig(`${dir}/${view}_${e}_T${pad3(s)}.png`,
-      view.endsWith("diff") ? `${e} − ${REF}` : view === "rmserel" ? `${e} vs ${REF}` : e)).join("");
+      view.endsWith("diff") ? `${e} − ${REF}` : view.endsWith("rel") ? `${e} vs ${REF}` : e)).join("");
   }
   $("figs").innerHTML = html;
   renderTable(p, s);
@@ -164,21 +170,25 @@ function renderTable(p, s) {
   const sc = regionInfo().scores[s];
   if (!sc) { $("table").innerHTML = ""; return; }
   const units = p.units ? ` [${p.units}]` : "";
+  const metrics = ENS ? ["bias", "rmse", "mae", "fcrps"] : ["bias", "rmse", "mae"];
+  const relCell = (e, m) => {
+    if (e === REF) return "<td>–</td>";
+    const rel = 100 * (sc[e][m] / sc[REF][m] - 1);
+    return `<td class="${rel < 0 ? "better" : rel > 0 ? "worse" : ""}">${rel > 0 ? "+" : ""}${rel.toFixed(2)} %</td>`;
+  };
   const rows = EXPS.map(e => {
-    const cells = ["bias", "rmse", "mae"].map(m => {
+    const cells = metrics.map(m => {
       const v = sc[e][m], r = sc[REF][m];
       let cls = "";
       if (e !== REF && m !== "bias") cls = v < r ? "better" : v > r ? "worse" : "";
       if (e !== REF && m === "bias") cls = Math.abs(v) < Math.abs(r) ? "better" : Math.abs(v) > Math.abs(r) ? "worse" : "";
       return `<td class="${cls}">${v.toFixed(3)}</td>`;
     }).join("");
-    const rel = 100 * (sc[e].rmse / sc[REF].rmse - 1);
-    const relCell = e === REF ? "<td>–</td>"
-      : `<td class="${rel < 0 ? "better" : rel > 0 ? "worse" : ""}">${rel > 0 ? "+" : ""}${rel.toFixed(2)} %</td>`;
-    return `<tr><td>${e}${e === REF ? " (ref)" : ""}</td>${cells}${relCell}</tr>`;
+    const rels = relCell(e, "rmse") + (ENS ? relCell(e, "fcrps") : "");
+    return `<tr><td>${e}${e === REF ? " (ref)" : ""}</td>${cells}${rels}</tr>`;
   }).join("");
   $("table").innerHTML = `<table><thead><tr><th>T+${s}h · ${sc.n} pairs · ${sc.stations} stations</th>
-    <th>Bias${units}</th><th>RMSE${units}</th><th>MAE${units}</th><th>RMSE vs ${REF}</th></tr></thead><tbody>${rows}</tbody></table>`;
+    <th>Bias${units}</th><th>RMSE${units}</th><th>MAE${units}</th>${ENS ? `<th>FCRPS${units}</th>` : ""}<th>RMSE vs ${REF}</th>${ENS ? `<th>FCRPS vs ${REF}</th>` : ""}</tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function move(d) {

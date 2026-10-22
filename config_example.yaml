@@ -53,6 +53,14 @@ experiments:
     type: fc
     # anoffset: 9          # needed for stream lwda
     upload: true
+  # Ensembles: type pf with the member numbers; adds fair CRPS maps and scores
+  # - label: ens
+  #   class: rd
+  #   stream: enfo
+  #   expver: ijkl
+  #   type: pf
+  #   numbers: 1/to/8
+  #   control: true        # add the control forecast (cf) as a member
   # - label: exp2
   #   class: rd
   #   stream: lwda

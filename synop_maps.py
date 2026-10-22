@@ -112,6 +112,8 @@ EXP_DEFAULTS = {
     "class": "rd",
     "stream": "oper",
     "type": "fc",
+    "numbers": None,  # ensemble members for type pf, e.g. 1/to/50
+    "control": False,  # type pf: add the control forecast (type cf) as a member
     "upload": True,
     "collocate": None,  # default: the global `collocate`
     "anoffset": None,
@@ -364,6 +366,12 @@ class Config:
             for spec, _ in e["variants"]:
                 if spec["collocate"] not in ("vino", "local"):
                     sys.exit(f"experiment {e['label']}: collocate must be 'vino' or 'local'")
+            for spec, _ in e["variants"]:
+                if (spec["type"] == "pf" and not spec["numbers"]
+                        and (uploads(spec) or collocated(spec))):
+                    sys.exit(f"experiment {e['label']}: type pf needs `numbers` (e.g. 1/to/50)")
+                if spec["control"] and spec["type"] != "pf":
+                    sys.exit(f"experiment {e['label']}: `control: true` needs type pf")
             e["by_date"] = {d: spec for spec, ds in e["variants"] for d in ds}
             self.experiments.append(e)
         labels = [e["label"] for e in self.experiments]
@@ -371,6 +379,9 @@ class Config:
             sys.exit("experiment labels must be unique")
         if not self.experiments:
             sys.exit("no experiments configured")
+        # ensemble experiments add fair CRPS maps and scores
+        self.ensemble = any(spec["type"] == "pf" for e in self.experiments for spec, _ in e["variants"])
+        self.metrics = {m: v for m, v in METRICS.items() if self.ensemble or not m.startswith("fcrps")}
 
     def resolve_open_ends(self, raw_periods, experiments, refresh):
         """{period: end date} for periods whose end is "-": the last base date
@@ -457,7 +468,7 @@ class Config:
             parts = ["vino", spec["class"], spec["stream"], vino_expver(spec), spec["type"]]
         else:
             parts = ["local", spec["class"], spec["stream"], spec["expver"], spec["type"]]
-        for k in ("anoffset", "origin", "grid", "resol"):
+        for k in ("anoffset", "origin", "grid", "resol", "numbers"):
             if spec[k] not in (None, ""):
                 parts.append(f"{k}{spec[k]}")
         if spec["collocate"] == "local":
@@ -468,9 +479,13 @@ class Config:
         return self.store.joinpath("fc", *(str(x).replace("/", "x").replace(" ", "") for x in parts))
 
     def fc_path(self, e, p, d, t, s):
-        """Forecast file of experiment e for base date d, time t, step s (None if absent)."""
+        """Forecast files of experiment e for base date d, time t, step s: one,
+        or pf + cf for an ensemble with its control (None if any is absent)."""
         spec = e["by_date"].get(d)
-        return fc_file(self.fc_dir(spec), p, d, t, s) if spec else None
+        if not spec:
+            return None
+        files = [fc_file(self.fc_dir(ds), p, d, t, s) for ds in data_specs(spec)]
+        return None if None in files else files
 
     def store_lock(self, root, name):
         """Lock for the files called `name` below store directory `root`."""
@@ -489,6 +504,15 @@ class Config:
     def steps_for(self, p):
         # accumulated/period parameters need step >= period
         return [s for s in self.steps if s >= p.period]
+
+
+def data_specs(spec):
+    """The data sets that make up one experiment variant: the forecast itself
+    and, for an ensemble with `control: true`, its control forecast (cf)."""
+    out = [spec]
+    if spec["control"]:
+        out.append(dict(spec, type="cf", numbers=None, control=False))
+    return out
 
 
 def day_dir(root, d):
@@ -572,7 +596,7 @@ def stage_upload(cfg, args):
         with lock(cfg.workdir / "locks" / f"upload_{exp['label']}.lock"):
             # one combination per (expver variant, parameter, time)
             combos = []
-            for spec, dates in exp["variants"]:
+            for spec, dates in ((ds, dates) for vs, dates in exp["variants"] for ds in data_specs(vs)):
                 if not uploads(spec):
                     continue
                 for p in cfg.params:
@@ -657,6 +681,8 @@ def genfc_cmd(cfg, exp, p, t, dates, steps):
     for k in ("anoffset", "origin", "expver_label", "grid", "resol"):
         if exp[k] not in (None, ""):
             cmd += [f"--{k}", exp[k]]
+    if exp["numbers"] not in (None, ""):
+        cmd += ["--numbers", "/".join(tokens(exp["numbers"]))]
     if g.get("ignore_missing"):
         cmd.append("--ignore_missing")
     if g.get("get_orog_once"):
@@ -681,7 +707,8 @@ def stage_collocate(cfg, args):
     if not exps:
         log("nothing to collocate (no experiments with collocate: local selected)")
         return 0
-    tasks = [(spec, dates, p, t) for e in exps for spec, dates in e["variants"] if collocated(spec)
+    tasks = [(spec, dates, p, t) for e in exps for vs, dates in e["variants"]
+             for spec in data_specs(vs) if collocated(spec)
              for p in cfg.params if cfg.steps_for(p) for t in cfg.times]
     failures = []
     for missing in parallel_map(cfg, lambda a: collocate_set(cfg, args.force, *a), tasks):
@@ -778,7 +805,8 @@ def stage_download(cfg, args):
                       for hour, dates in sorted(obs_needed(cfg, p).items())]
             for exp in cfg.experiments:
                 tasks += [(download_fc, (cfg, spec, vdates, p, t))
-                          for spec, vdates in exp["variants"] if spec["collocate"] == "vino"
+                          for vs, vdates in exp["variants"] for spec in data_specs(vs)
+                          if spec["collocate"] == "vino"
                           for t in cfg.times]
         log(f"checking {len(tasks)} observation/forecast sets, {cfg.parallel} at a time")
         parallel_map(cfg, lambda task: task[0](*task[1]), tasks)
@@ -850,8 +878,9 @@ def print_status(cfg):
                       for d in cfg.dates for t in cfg.times for s in steps)
             print(f"  {p.key:8s} {exp['label']:10s} {nfc:6d} / {n} files")
     for exp in cfg.experiments:
-        for spec, _ in exp["variants"]:
-            print(f"  {exp['label']} {spec['expver']}: {cfg.fc_dir(spec)}")
+        for vs, _ in exp["variants"]:
+            for spec in data_specs(vs):
+                print(f"  {exp['label']} {spec['expver']} {spec['type']}: {cfg.fc_dir(spec)}")
 
 
 def stage_status(cfg, args):
@@ -888,14 +917,17 @@ def read_geo(path):
                 meta[k.strip()] = v.strip()
     df = pd.read_csv(path, sep=r"\s+", skiprows=skip, names=cols, header=None,
                      dtype={"stnid": str}, engine="c")
-    for c in ("value_0", "elevation"):
+    # one value column per ensemble member (value_0 ... value_<n-1>)
+    vals = sorted((c for c in df.columns if re.fullmatch(r"value_\d+", str(c))),
+                  key=lambda c: int(c[6:])) or ["value_0"]
+    for c in vals + ["elevation"]:
         if c not in df:
             df[c] = np.nan
         df[c] = pd.to_numeric(df[c], errors="coerce")
         df[c] = df[c].where(df[c].abs() < MISSING)
     df["elevation"] = df["elevation"].where(df["elevation"] <= 9000)  # obs use 99999
-    df = df[df["value_0"].notna()]
-    return df[["stnid", "latitude", "longitude", "elevation", "value_0"]], meta
+    df = df.dropna(subset=vals)
+    return df[["stnid", "latitude", "longitude", "elevation"] + vals], meta
 
 
 def station_key(df):
@@ -915,6 +947,9 @@ def matched(cfg, p, step, dates=None):
     station elevations are both known and differ by more than plot.max_dz are
     dropped. This follows the processing of quaver's error_map. The columns
     dz_<label> hold the model minus station elevation (NaN when unknown).
+    For ensembles (several members per file) the forecast column is the
+    ensemble mean, and crps_<label> holds the fair CRPS of each pair (the
+    absolute error for single forecasts).
     """
     frames, units = [], ""
     lapse = float(cfg.plot["lapse_rate"] or 0) if p.param in LAPSE_PARAMS else 0.0
@@ -932,14 +967,21 @@ def matched(cfg, p, step, dates=None):
             m = obs.assign(key=station_key(obs)).rename(columns={"value_0": "obs", "elevation": "z_obs"})
             m = m.drop_duplicates("key")[["key", "latitude", "longitude", "z_obs", "obs"]]
             labels = [e["label"] for e in cfg.experiments]
-            for lab, f in zip(labels, fcs):
-                fc, meta = read_geo(str(f))
-                units = units or meta.get("units", "") or ometa.get("units", "")
-                fc = fc.assign(key=station_key(fc)).drop_duplicates("key")
-                fc = fc[["key", "elevation", "value_0"]].rename(
-                    columns={"value_0": lab, "elevation": f"z_{lab}"})
-                m = m.merge(fc, on="key", how="inner")
-            need = ["obs"] + labels
+            members = {}
+            for lab, files in zip(labels, fcs):
+                # members of all files of the experiment (pf, plus cf with control: true)
+                members[lab] = []
+                for i, f in enumerate(files):
+                    fc, meta = read_geo(str(f))
+                    units = units or meta.get("units", "") or ometa.get("units", "")
+                    fc = fc.assign(key=station_key(fc)).drop_duplicates("key")
+                    vals = [c for c in fc.columns if c.startswith("value_")]
+                    names = [f"{lab}#{len(members[lab]) + j}" for j in range(len(vals))]
+                    members[lab] += names
+                    cols = {"elevation": f"z_{lab}", **dict(zip(vals, names))}
+                    keep = ["key"] + (["elevation"] if i == 0 else []) + vals
+                    m = m.merge(fc[keep].rename(columns=cols), on="key", how="inner")
+            need = ["obs"] + [c for lab in labels for c in members[lab]]
             if p.param in OBS_RANGE:
                 lo, hi = OBS_RANGE[p.param]
                 m = m[m["obs"].between(lo, hi)]
@@ -951,11 +993,16 @@ def matched(cfg, p, step, dates=None):
             if lapse:
                 for lab in labels:
                     # model surface above the station -> station is warmer
-                    m[lab] = m[lab] + lapse * (m[f"z_{lab}"] - m["z_obs"])
+                    m[members[lab]] = m[members[lab]].add(lapse * (m[f"z_{lab}"] - m["z_obs"]), axis=0)
             m = m.dropna(subset=need)
+            obs_v = m["obs"].to_numpy(float)
             for lab in labels:
+                ens = m[members[lab]].to_numpy(float)
+                m[lab] = ens_mean(p, ens)
+                m[f"crps_{lab}"] = fair_crps(p, ens, obs_v)
                 m[f"dz_{lab}"] = m[f"z_{lab}"] - m["z_obs"]
-            m = m[["key", "latitude", "longitude", "obs"] + labels + [f"dz_{lab}" for lab in labels]]
+            m = m[["key", "latitude", "longitude", "obs"] + labels
+                  + [f"crps_{lab}" for lab in labels] + [f"dz_{lab}" for lab in labels]]
             m["base"] = f"{ymd(d)}{t:02d}"
             frames.append(m)
     if not frames:
@@ -968,6 +1015,32 @@ def error(p, fc, obs):
     if p.param == "10dd":  # wind direction: shortest angular difference
         e = (e + 180.0) % 360.0 - 180.0
     return e
+
+
+def ens_mean(p, ens):
+    """Ensemble mean of the members (columns of ens); circular for 10dd."""
+    if ens.shape[1] == 1:
+        return ens[:, 0]
+    if p.param == "10dd":
+        r = np.deg2rad(ens)
+        return np.rad2deg(np.arctan2(np.sin(r).mean(1), np.cos(r).mean(1))) % 360.0
+    return ens.mean(1)
+
+
+def fair_crps(p, ens, obs):
+    """Fair CRPS (Ferro 2014) of each row of ens (members in columns):
+    mean |x_i - y| - sum_{i<j} |x_i - x_j| / (m (m - 1)).
+    For a single member it is the absolute error."""
+    m = ens.shape[1]
+    skill = np.abs(error(p, ens, obs[:, None])).mean(1)
+    if m == 1:
+        return skill
+    if p.param == "10dd":
+        spread = np.abs(error(p, ens[:, :, None], ens[:, None, :])).sum((1, 2)) / 2
+    else:
+        # sum_{i<j} |x_i - x_j| = sum_k (2k - m - 1) x_(k) over the sorted members
+        spread = (np.sort(ens, axis=1) * (2 * np.arange(1, m + 1) - m - 1)).sum(1)
+    return skill - spread / (m * (m - 1))
 
 
 def in_region(df, extent):
@@ -991,6 +1064,7 @@ def station_stats(cfg, p, df, nbases):
         work[f"bias_{lab}"] = err
         work[f"sq_{lab}"] = err ** 2
         work[f"abs_{lab}"] = err.abs()
+        work[f"crps_{lab}"] = df[f"crps_{lab}"]
     g = work.groupby("key")
     st = g[["latitude", "longitude"]].first()
     st["n"] = g.size()
@@ -1000,12 +1074,16 @@ def station_stats(cfg, p, df, nbases):
         st[f"bias_{lab}"] = g[f"bias_{lab}"].mean()
         st[f"rmse_{lab}"] = np.sqrt(g[f"sq_{lab}"].mean())
         st[f"mae_{lab}"] = g[f"abs_{lab}"].mean()
+        st[f"fcrps_{lab}"] = g[f"crps_{lab}"].mean()
     ref = labels[0]
     for lab in labels[1:]:
         st[f"rmsediff_{lab}"] = st[f"rmse_{lab}"] - st[f"rmse_{ref}"]
         st[f"maediff_{lab}"] = st[f"mae_{lab}"] - st[f"mae_{ref}"]
         rel = 100.0 * (st[f"rmse_{lab}"] / st[f"rmse_{ref}"] - 1.0)
         st[f"rmserel_{lab}"] = rel.replace([np.inf, -np.inf], np.nan)
+        st[f"fcrpsdiff_{lab}"] = st[f"fcrps_{lab}"] - st[f"fcrps_{ref}"]
+        rel = 100.0 * (st[f"fcrps_{lab}"] / st[f"fcrps_{ref}"] - 1.0)
+        st[f"fcrpsrel_{lab}"] = rel.replace([np.inf, -np.inf], np.nan)
     min_count = max(1, float(cfg.plot["min_fraction"]) * nbases)
     return st[st["n"] >= min_count].reset_index()
 
@@ -1018,7 +1096,8 @@ def overall_scores(cfg, st):
         lab = e["label"]
         out[lab] = {"bias": float(st[f"bias_{lab}"].mean()),
                     "rmse": float(np.sqrt((st[f"rmse_{lab}"] ** 2).mean())),
-                    "mae": float(st[f"mae_{lab}"].mean())}
+                    "mae": float(st[f"mae_{lab}"].mean()),
+                    "fcrps": float(st[f"fcrps_{lab}"].mean())}
     return out
 
 
@@ -1066,8 +1145,14 @@ METRICS = {
     "rmsediff": ("RdBu_r", True, "RMSE difference vs reference (red = worse)"),
     "maediff": ("RdBu_r", True, "MAE difference vs reference (red = worse)"),
     "rmserel": ("RdBu_r", True, "relative RMSE change vs reference (red = worse)"),
+    # only with ensemble experiments; for single forecasts the CRPS is the MAE
+    "fcrps": ("viridis", False, "fair CRPS"),
+    "fcrpsdiff": ("RdBu_r", True, "fair CRPS difference vs reference (red = worse)"),
+    "fcrpsrel": ("RdBu_r", True, "relative fair CRPS change vs reference (red = worse)"),
 }
-PERCENT = {"rmserel"}
+PERCENT = {"rmserel", "fcrpsrel"}
+NAMES = {"rmserel": "RMSE change", "fcrps": "FCRPS", "fcrpsdiff": "FCRPS diff",
+         "fcrpsrel": "FCRPS change"}
 OROG = ("BrBG_r", "model minus station elevation")  # step-independent map orog_<label>.png  # metrics plotted in % rather than the parameter's units
 STYLE = 2  # bump to redraw all images after a change in the plotting code
 
@@ -1155,17 +1240,26 @@ def draw_map(path, lon, lat, val, title, cmap, vmin, vmax, extent, label, dpi, s
     plt.close(fig)
 
 
-def draw_scores(path, p, steps, scores, labels, units, region, dpi):
+def draw_scores(path, p, steps, scores, labels, units, region, dpi, ensemble=False):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     ref = labels[0]
     panels = [("bias", f"Bias [{units}]"), ("rmse", f"RMSE [{units}]"), ("mae", f"MAE [{units}]")]
+    if ensemble:
+        panels.append(("fcrps", f"FCRPS [{units}]"))
     if len(labels) > 1:
         panels.append(("rmserel", f"RMSE change vs {ref} [%]"))
-    fig, axs = plt.subplots(1, len(panels), figsize=(4.4 * len(panels), 4.0), sharex=True,
-                            layout="constrained")
+        if ensemble:
+            panels.append(("fcrpsrel", f"FCRPS change vs {ref} [%]"))
+    ncols = 3 if len(panels) > 4 else len(panels)
+    nrows = -(-len(panels) // ncols)
+    fig, axs = plt.subplots(nrows, ncols, figsize=(4.4 * ncols, 4.0 * nrows), sharex=True,
+                            squeeze=False, layout="constrained")
+    axs = axs.ravel()
+    for ax in axs[len(panels):]:
+        ax.set_visible(False)
     colors = {lab: SERIES[i % len(SERIES)] for i, lab in enumerate(labels)}
 
     def get(s, lab, m):
@@ -1173,16 +1267,16 @@ def draw_scores(path, p, steps, scores, labels, units, region, dpi):
 
     for ax, (m, ylabel) in zip(axs, panels):
         for lab in labels:
-            if m == "rmserel":
+            if m.endswith("rel"):
                 if lab == ref:
                     continue
-                y = [100.0 * (get(s, lab, "rmse") / get(s, ref, "rmse") - 1.0) for s in steps]
+                y = [100.0 * (get(s, lab, m[:-3]) / get(s, ref, m[:-3]) - 1.0) for s in steps]
             else:
                 y = [get(s, lab, m) for s in steps]
             ax.plot(steps, y, marker="o", ms=3.5, lw=1.6, color=colors[lab], label=lab)
-        if m in ("bias", "rmserel"):
+        if m == "bias" or m.endswith("rel"):
             ax.axhline(0, color="0.3", lw=0.8)
-        if m == "rmserel":
+        if m.endswith("rel"):
             lo, hi = ax.get_ylim()
             ax.axhspan(0, max(hi, 0), color="#d1495b", alpha=0.06, lw=0)
             ax.axhspan(min(lo, 0), 0, color="#2e8b57", alpha=0.06, lw=0)
@@ -1238,7 +1332,11 @@ def stage_plot(cfg, args):
         for per in periods:
             d = cfg.periods[per]
             manifest["periods"][per] = {"dates": f"{ymd(d[0])}-{ymd(d[-1])}", "params": {}}
-        for m, (_, div, desc) in METRICS.items():
+        for m, (_, div, desc) in cfg.metrics.items():
+            if cfg.ensemble and m in ("bias", "rmse", "mae"):
+                desc += " of the ensemble mean for ensembles"
+            elif m == "fcrps":
+                desc += " (absolute error for single forecasts)"
             manifest["metrics"][m] = desc
         manifest["metrics"]["orog"] = (OROG[1] + " (brown = model surface above the station)."
                                        " Stations verified at any step are shown.")
@@ -1260,7 +1358,7 @@ def stage_plot(cfg, args):
                     continue
                 # common colour limits over all steps and periods so that maps are comparable
                 lims = {}
-                for m in METRICS:
+                for m in cfg.metrics:
                     cols = [c for c in all_stats[0].columns if c.startswith(m + "_")]
                     vals = np.concatenate([st[c].values for st in all_stats for c in cols]) if cols else []
                     lims[m] = nice_limit(vals, 98 if METRICS[m][1] else 95)
@@ -1283,7 +1381,7 @@ def stage_plot(cfg, args):
                         st = stats[s]
                         bases = res[s]["bases"]
                         span = f"{bases[0][:8]}-{bases[-1][:8]}"
-                        for m, (cmap, div, desc) in METRICS.items():
+                        for m, (cmap, div, desc) in cfg.metrics.items():
                             for lab in labels:
                                 col = f"{m}_{lab}"
                                 if col not in st:
@@ -1292,7 +1390,7 @@ def stage_plot(cfg, args):
                                 vmin, vmax = (-lim, lim) if div else (0.0, lim)
                                 path = rdir / f"{m}_{lab}_T{s:03d}.png"
                                 vs = f" − {ref}" if m.endswith("diff") else f" vs {ref}" if m in PERCENT else ""
-                                name = "RMSE change" if m == "rmserel" else m.upper().replace("DIFF", " diff")
+                                name = NAMES.get(m, m.upper().replace("DIFF", " diff"))
                                 title = f"{p.label} {name}   {lab}{vs}   T+{s}h"
                                 subtitle = f"{ptag}{rname} · {len(bases)} forecasts {span} · {len(st)} stations"
                                 note = map_note(m, st[col].values)
@@ -1344,7 +1442,8 @@ def stage_plot(cfg, args):
                     if want(path, sig):
                         jobs.append(("scores", str(path), dict(p=p, steps=rsteps, scores=scores,
                                                                labels=labels, units=units,
-                                                               region=region_title, dpi=dpi)))
+                                                               region=region_title, dpi=dpi,
+                                                               ensemble=cfg.ensemble)))
                     pinfo = manifest["periods"][per]["params"].setdefault(
                         p.key, {"label": p.label, "units": units, "regions": {}})
                     pinfo["regions"][rname] = {
