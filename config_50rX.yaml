@@ -64,7 +64,7 @@ experiments:
   - label: APT_v3.3
     class: rd
     stream: lwda
-    expver: {DJF: j967, JJA: j84m}
+    expver: {DJF: j967, JJA: jafj}
     anoffset: 9
     type: fc
     upload: true    

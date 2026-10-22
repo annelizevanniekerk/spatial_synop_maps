@@ -82,7 +82,7 @@ experiments:
     expver: {DJF: j967}
     anoffset: 9
     type: fc
-    upload: true
+    upload: false
 
 sources: [synop]               # VINO observation sources
 interpolation: nearest_point   # nearest_point | nearest_land_point | nearest_sea_point

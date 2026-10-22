@@ -176,6 +176,10 @@ uploaded or downloaded; observations still come from VINO through
   by more than `plot.max_dz` are excluded (stations without an elevation are
   kept, as in `error_map --orography_filter_threshold`); `max_dz: null`
   switches this off.
+* `orog_<experiment>.png` maps show the model minus station elevation per
+  station (brown = model surface above the station), over the stations
+  verified at any step for that parameter, region and period. They do not
+  depend on the step.
 * `rmserel` maps show the relative RMSE change of each experiment against the
   reference per station, `100 * (RMSE_exp / RMSE_ref - 1)` in %, so negative
   (blue) is better. The colour scale is capped at ±100 %.
@@ -193,7 +197,7 @@ uploaded or downloaded; observations still come from VINO through
 ### HTML browser (`<workdir>/index.html`)
 
 * Selectors for parameter, region, view (Bias / RMSE / MAE / RMSE difference /
-  MAE difference / Relative RMSE change / Scores vs step / Single forecasts) and forecast step.
+  MAE difference / Relative RMSE change / Model − station height / Scores vs step / Single forecasts) and forecast step.
   Use the slider, the ◀ ▶ buttons or the ← → keys to change the step.
 * All experiments are shown side by side. Below the maps, a table gives the
   bias, RMSE, MAE and relative RMSE change for the current step: green is

@@ -252,6 +252,7 @@ def run(cmd):
 # --------------------------------------------------------------------------
 
 OPEN_END = "-"
+MAX_GAP = 7  # days; an open period ends at the first longer gap in the MARS dates
 
 
 def period_spec(e, per):
@@ -280,12 +281,23 @@ def mars_last_date(cfg, e, start):
         text = "list," + ",".join(f"{k}={v}" for k, v in req.items()) + "\n"
         log(f"MARS list: {text.strip()}")
         r = subprocess.run([cfg.tools["mars"]], input=text, capture_output=True, text=True)
-        dates = re.findall(r"\b(\d{4})-(\d{2})-(\d{2})\b", r.stdout)
-        if r.returncode or not dates:
-            if r.returncode:
-                log("MARS list failed:", (r.stderr or r.stdout).strip()[-500:])
+        dates = sorted({dt.date(int(y), int(m), int(d))
+                        for y, m, d in re.findall(r"\b(\d{4})-(\d{2})-(\d{2})\b", r.stdout)})
+        if r.returncode:
+            log("MARS list failed:", (r.stderr or r.stdout).strip()[-500:])
+        # the data must start near the period start and is followed only up to
+        # the first gap of more than MAX_GAP days, so that e.g. a run of the
+        # same expver in another year does not extend the period
+        if r.returncode or not dates or (dates[0] - start).days > MAX_GAP:
+            log(f"{e.get('label', e['expver'])} ({e['expver']}) {t:02d}z: no forecasts in MARS from "
+                f"{ymd(start)}" + (f" (first date found {ymd(dates[0])})" if dates else ""))
             return None
-        last.append(max(dt.date(int(y), int(m), int(d)) for y, m, d in dates))
+        end = dates[0]
+        for d in dates[1:]:
+            if (d - end).days > MAX_GAP:
+                break
+            end = d
+        last.append(end)
     return min(last)
 
 
@@ -901,7 +913,8 @@ def matched(cfg, p, step, dates=None):
     rejected. For 2t (and tmax/tmin) the forecasts are corrected from model
     orography to station height with plot.lapse_rate. Stations whose model and
     station elevations are both known and differ by more than plot.max_dz are
-    dropped. This follows the processing of quaver's error_map.
+    dropped. This follows the processing of quaver's error_map. The columns
+    dz_<label> hold the model minus station elevation (NaN when unknown).
     """
     frames, units = [], ""
     lapse = float(cfg.plot["lapse_rate"] or 0) if p.param in LAPSE_PARAMS else 0.0
@@ -940,7 +953,9 @@ def matched(cfg, p, step, dates=None):
                     # model surface above the station -> station is warmer
                     m[lab] = m[lab] + lapse * (m[f"z_{lab}"] - m["z_obs"])
             m = m.dropna(subset=need)
-            m = m[["key", "latitude", "longitude", "obs"] + labels]
+            for lab in labels:
+                m[f"dz_{lab}"] = m[f"z_{lab}"] - m["z_obs"]
+            m = m[["key", "latitude", "longitude", "obs"] + labels + [f"dz_{lab}" for lab in labels]]
             m["base"] = f"{ymd(d)}{t:02d}"
             frames.append(m)
     if not frames:
@@ -970,7 +985,7 @@ def station_stats(cfg, p, df, nbases):
     for at least plot.min_fraction of the nbases forecasts.
     """
     labels = [e["label"] for e in cfg.experiments]
-    work = df[["key", "latitude", "longitude"]].copy()
+    work = df[["key", "latitude", "longitude"] + [f"dz_{lab}" for lab in labels]].copy()
     for lab in labels:
         err = error(p, df[lab], df["obs"])
         work[f"bias_{lab}"] = err
@@ -979,6 +994,8 @@ def station_stats(cfg, p, df, nbases):
     g = work.groupby("key")
     st = g[["latitude", "longitude"]].first()
     st["n"] = g.size()
+    for lab in labels:
+        st[f"dz_{lab}"] = g[f"dz_{lab}"].mean()
     for lab in labels:
         st[f"bias_{lab}"] = g[f"bias_{lab}"].mean()
         st[f"rmse_{lab}"] = np.sqrt(g[f"sq_{lab}"].mean())
@@ -1050,7 +1067,8 @@ METRICS = {
     "maediff": ("RdBu_r", True, "MAE difference vs reference (red = worse)"),
     "rmserel": ("RdBu_r", True, "relative RMSE change vs reference (red = worse)"),
 }
-PERCENT = {"rmserel"}  # metrics plotted in % rather than the parameter's units
+PERCENT = {"rmserel"}
+OROG = ("BrBG_r", "model minus station elevation")  # step-independent map orog_<label>.png  # metrics plotted in % rather than the parameter's units
 STYLE = 2  # bump to redraw all images after a change in the plotting code
 
 LAND, OCEAN = "#f3f1ec", "#e3ecf3"
@@ -1222,6 +1240,8 @@ def stage_plot(cfg, args):
             manifest["periods"][per] = {"dates": f"{ymd(d[0])}-{ymd(d[-1])}", "params": {}}
         for m, (_, div, desc) in METRICS.items():
             manifest["metrics"][m] = desc
+        manifest["metrics"]["orog"] = (OROG[1] + " (brown = model surface above the station)."
+                                       " Stations verified at any step are shown.")
 
         def want(path, sig):
             sigs[str(path)] = sig
@@ -1246,6 +1266,9 @@ def stage_plot(cfg, args):
                     lims[m] = nice_limit(vals, 98 if METRICS[m][1] else 95)
                     if m in PERCENT:
                         lims[m] = min(lims[m], 100.0)
+                dzcols = [f"dz_{lab}" for lab in labels]
+                lims["orog"] = nice_limit(np.concatenate(
+                    [st[c].values for st in all_stats for c in dzcols]), 98)
                 for per in periods:
                     rsteps = found[per]
                     if not rsteps:
@@ -1285,6 +1308,35 @@ def stage_plot(cfg, args):
                         if cfg.plot["daily_maps"]:
                             jobs += daily_jobs(p, s, rname, extent, res[s]["regions"][rname]["daily"],
                                                units, dpi, want, labels, rdir / "daily")
+                    # model - station height, over the stations verified at any step
+                    dz = pd.concat([stats[s][["key", "longitude", "latitude"] + dzcols] for s in rsteps])
+                    dz = dz.drop_duplicates("key")
+                    nbases = len({b for s in rsteps for b in res[s]["bases"]})
+                    orog = []
+                    for lab in labels:
+                        val = dz[f"dz_{lab}"].values
+                        ok = np.isfinite(val)
+                        if not ok.any():
+                            continue
+                        orog.append(lab)
+                        path = rdir / f"orog_{lab}.png"
+                        lim = lims["orog"]
+                        title = f"Model − station height   {lab}"
+                        subtitle = f"{ptag}{rname} · {p.label} stations · {ok.sum()} stations"
+                        v = val[ok]
+                        note = (f"mean {v.mean():+.0f} m   median {np.median(v):+.0f} m   "
+                                f"mean |dz| {np.abs(v).mean():.0f} m\n"
+                                f"model above station at {100 * (v > 0).mean():.0f}% / "
+                                f"below at {100 * (v < 0).mean():.0f}% of stations")
+                        sig = hashlib.md5(json.dumps(
+                            [STYLE, dpi, nbases, int(ok.sum()), float(v.sum()), lim,
+                             title, subtitle, note]).encode()).hexdigest()
+                        if want(path, sig):
+                            jobs.append(("map", str(path), dict(
+                                lon=dz.longitude.values, lat=dz.latitude.values, val=val,
+                                title=title, subtitle=subtitle, note=note, cmap=OROG[0],
+                                vmin=-lim, vmax=lim, extent=extent,
+                                label=f"{OROG[1]} [m]", dpi=dpi)))
                     path = rdir / "scores.png"
                     region_title = rname if per == "all" else f"{rname} – {per}"
                     sig = hashlib.md5(json.dumps([STYLE, dpi, region_title, scores],
@@ -1297,6 +1349,7 @@ def stage_plot(cfg, args):
                         p.key, {"label": p.label, "units": units, "regions": {}})
                     pinfo["regions"][rname] = {
                         "steps": rsteps,
+                        "orog": orog,
                         "scores": {str(s): scores[s] for s in rsteps},
                         "daily": sorted({b for s in rsteps for b in res[s]["bases"]})
                         if cfg.plot["daily_maps"] else [],

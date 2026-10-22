@@ -83,6 +83,7 @@ const VIEWS = [
   ["rmsediff", `RMSE difference vs ${REF}`, OTHERS],
   ["maediff", `MAE difference vs ${REF}`, OTHERS],
   ["rmserel", `Relative RMSE change vs ${REF} (%)`, OTHERS],
+  ["orog", "Model − station height", null],
   ["scores", "Scores vs step", null],
   ["daily", "Single forecasts", null],
 ].filter(v => v[2] === null || v[2].length);
@@ -110,7 +111,8 @@ function refreshControls() {
   const p = params()[$("param").value];
   if (!p) { $("figs").innerHTML = '<div class="missing">No data plotted yet.</div>'; return false; }
   fill($("region"), Object.keys(p.regions).map(r => [r, r]), state.region);
-  const views = VIEWS.filter(v => v[0] !== "daily" || regionInfo().daily.length);
+  const views = VIEWS.filter(v => (v[0] !== "daily" || regionInfo().daily.length)
+    && (v[0] !== "orog" || regionInfo().orog?.length));
   fill($("view"), views.map(([v, t]) => [v, t]), state.view);
   const daily = regionInfo().daily;
   fill($("base"), daily.map(b => [b, `${b.slice(0,4)}-${b.slice(4,6)}-${b.slice(6,8)} ${b.slice(8)}z`]), state.base);
@@ -142,6 +144,8 @@ function render() {
   let html = "";
   if (view === "scores") {
     html = fig(`${dir}/scores.png`, `${p.label} – all steps`);
+  } else if (view === "orog") {
+    html = regionInfo().orog.map(e => fig(`${dir}/orog_${e}.png`, e)).join("");
   } else if (view === "daily") {
     const b = $("base").value;
     html = fig(`${dir}/daily/${b}/obs_T${pad3(s)}.png`, "Observations")
