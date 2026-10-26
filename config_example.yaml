@@ -30,6 +30,11 @@ parameters:
   - param: msl
   - param: tp
     period: 24
+  # Upper-air parameters at TEMP (radiosonde) stations: t, z, ff, dd, td on
+  # pressure levels in hPa. They are always collocated locally from MARS
+  # (needs upper_air.grid), for every experiment including operations.
+  # - {param: t, levels: [850, 500, 250]}
+  # - {param: z, levels: [500]}        # plotted as geopotential height (gpm)
 
 # Experiments. The FIRST one is the reference for difference maps.
 #   upload: true   -> missing dates are pushed to VINO with vino_genfc
@@ -77,6 +82,12 @@ genfc:
   ignore_missing: true         # skip dates missing in MARS instead of failing
   get_orog_once: true
   extra_args: []               # any other vino_genfc arguments, e.g. ["--grid", "0.1/0.1"]
+
+upper_air:                     # only used for parameters with `levels`
+  sources: [temp]              # VINO data set of the observations
+  grid: O400                  # MARS grid the forecast fields are interpolated to;
+                               # an experiment's own `grid` takes precedence
+  interpolation: nearest_point # nearest_point | bilinear
 
 plot:
   regions:                     # name: [west, east, south, north] or null for global

@@ -6,3 +6,4 @@ ecsbatch.log.*
 __pycache__/
 *.pyc
 *.new
+config_MJJA26.yaml

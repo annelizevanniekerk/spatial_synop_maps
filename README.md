@@ -32,6 +32,7 @@ or computed finds it there and skips that work.
 | File | Purpose |
 |------|---------|
 | `synop_maps.py` | Main script with the stages `submit`, `upload`, `download`, `plot` and `status` |
+| `vino_upper.py` | Helper for upper-air (TEMP) parameters, run by `synop_maps.py` |
 | `browser_template.html` | Template for the HTML browser. `plot` fills in the list of images and scores |
 | `config_example.yaml` | Annotated example configuration |
 | `README.md` | This file |
@@ -71,6 +72,9 @@ plot:
   regions: {global: null, europe: [-25, 45, 33, 72]}   # [west, east, south, north]
 ```
 
+* `database: fdb` (per experiment) retrieves the forecasts from an alternative
+  MARS database, e.g. experiments whose data is still in the FDB only. Needs
+  explicit end dates (MARS cannot list such a database).
 * `store` (top level) sets the shared data directory. Environment variables
   are expanded, e.g. `store: $PERM/synop_store`.
 * `collocate: vino | local` (top level default, can be overridden per
@@ -345,3 +349,42 @@ called `all`.
 Experiments can use different settings in different periods but keep one
 label (and so one line in the plots): give any setting as `{period: value}`,
 e.g. `expver: {DJF: abcd, JJA: efgh}`. Every period must be listed.
+
+## Upper-air (TEMP) parameters
+
+Radiosonde observations from the VINO `temp` data set can be verified like the
+SYNOP parameters. Give the pressure levels (hPa) of a parameter:
+
+```yaml
+parameters:
+  - {param: t, levels: [850, 500, 250]}
+  - {param: ff, levels: [250]}
+upper_air:
+  grid: O1280            # required: MARS grid for the forecast fields
+  # interpolation: bilinear   # default nearest_point
+  # sources: [temp]
+```
+
+Each level becomes a parameter of its own (`t850`, `t500`, ...) with the usual
+maps, scores and browser entries. Available are `t`, `z`, `ff`, `dd` and `td`
+(VINO has no other TEMP parameters).
+
+* `vino_getgeo` cannot select a level and `vino_genfc` has no upper-air
+  parameters, so both steps are done by `vino_upper.py` (run with the modules
+  `python3 ecmwf-toolbox vtb/vino`):
+  * observations come from VINO (`level_type=pl`) into `<store>/obs/temp/`;
+  * forecasts are always collocated locally, for every experiment (also
+    `collocate: vino` ones such as operations): the pressure-level fields are
+    retrieved from MARS on `upper_air.grid` (or the experiment's `grid`) and
+    picked at the stations of the observation file valid at each step. They go
+    to `<store>/fc/upper/<class>/<stream>/<expver>/<type>[...]/grid<grid>_<interpolation>_temp/`.
+* `ff` and `dd` are computed from u/v and `td` from t and q. `z` is plotted
+  as geopotential height (gpm).
+* This happens in the `collocate` stage, which first downloads the TEMP
+  observations it needs. Steps whose valid time has no TEMP observations
+  (e.g. 06/18 UTC at most stations) are skipped.
+* There is no height correction and no `max_dz` filter (no model height at
+  the stations), so the Model − station height view is not shown.
+* The observations are used as stored in VINO, with a gross-error check only
+  for t/td (170–340 K) and ff (≤ 150 m/s). A few bad soundings can inflate the
+  RMSE, e.g. for z500.

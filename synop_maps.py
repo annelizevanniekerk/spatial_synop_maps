@@ -9,7 +9,10 @@ Stages (each can be rerun safely; work already done is skipped):
     upload    vino_genfc   : MARS forecast fields -> station values in VINO
     collocate vino_genfc   : MARS forecast fields -> station values in local
                              geopoint files (no VINO upload; collocate: local)
-    download  vino_getgeo  : VINO -> local geopoint files (obs + forecasts)
+              vino_upper.py: same for pressure-level parameters at TEMP stations
+                             (always local, for every experiment)
+    download  vino_getgeo  : VINO -> local geopoint files (obs + forecasts);
+                             TEMP observations with vino_upper.py
     plot      matplotlib   : station maps + scores + index.html browser
 
 Geopoint files are kept in a store directory shared by all configs (`store`,
@@ -61,7 +64,13 @@ LAPSE_PARAMS = {"2t", "tmax", "tmin", "mx2t", "mn2t"}
 # gross-error limits for observations (quaver error_map "toss"); temperatures in K
 OBS_RANGE = {"2t": (173.15, 333.15), "tmax": (173.15, 333.15), "tmin": (173.15, 333.15),
              "mx2t": (173.15, 333.15), "mn2t": (173.15, 333.15),
-             "tp": (0, 900), "10ff": (0, 50), "tcc": (0, 100)}
+             "tp": (0, 900), "10ff": (0, 50), "tcc": (0, 100),
+             "t": (170, 340), "td": (170, 340), "ff": (0, 150)}
+ANGLE_PARAMS = {"10dd", "dd"}  # wind directions: angular errors and circular means
+# pressure-level parameters available from the VINO TEMP data set
+UPPER_PARAMS = {"t", "z", "ff", "dd", "td"}
+G = 9.80665  # z is plotted as geopotential height (gpm)
+UPPER_ENV = "module load python3 ecmwf-toolbox vtb/vino >/dev/null 2>&1"
 
 DEFAULTS = {
     "name": "synop_maps",
@@ -82,6 +91,11 @@ DEFAULTS = {
         "ignore_missing": True,
         "get_orog_once": True,
         "extra_args": [],
+    },
+    "upper_air": {
+        "sources": ["temp"],  # VINO data set of the pressure-level observations
+        "grid": None,  # MARS grid of the forecast fields, e.g. O1280 (an experiment's grid wins)
+        "interpolation": "nearest_point",  # nearest_point | bilinear
     },
     "plot": {
         "regions": {"global": None},
@@ -121,6 +135,7 @@ EXP_DEFAULTS = {
     "expver_label": None,
     "grid": None,
     "resol": None,
+    "database": None,  # alternative MARS database, e.g. fdb for data not archived yet
     "genfc_args": [],
 }
 
@@ -268,6 +283,9 @@ def mars_last_date(cfg, e, start):
     of experiment e at every configured base time (2t is used as the probe),
     and whose observations for that step already exist (valid time before
     yesterday). None if there is nothing."""
+    if e.get("database"):
+        sys.exit(f"experiment {e['expver']}: open end dates ('-') are not supported with "
+                 f"`database: {e['database']}` (MARS cannot list it), give an end date")
     maxstep = max(cfg.steps)
     cap = dt.date.today() - dt.timedelta(days=maxstep // 24 + 2)
     if cap < start:
@@ -304,16 +322,33 @@ def mars_last_date(cfg, e, start):
 
 
 class Param:
-    def __init__(self, d):
+    def __init__(self, d, level=None):
         if isinstance(d, str):
             d = {"param": d}
         self.param = str(d["param"])
         self.period = int(d.get("period", 0) or 0)
-        self.label = str(d.get("label", self.key))
+        self.level = level  # pressure level in hPa (TEMP), None for surface parameters
+        if level is not None and self.param not in UPPER_PARAMS:
+            sys.exit(f"{self.param}: pressure levels are available for {sorted(UPPER_PARAMS)} only")
+        default = f"{self.param} {level} hPa" if level is not None else self.key
+        self.label = str(d.get("label", default)).format(level=level)
+
+    @classmethod
+    def expand(cls, d):
+        """One Param per level of {param: t, levels: [850, 500]}."""
+        if isinstance(d, dict) and d.get("levels") is not None:
+            return [cls(d, int(lev)) for lev in expand_ints(d["levels"])]
+        return [cls(d)]
+
+    @property
+    def upper(self):
+        return self.level is not None
 
     @property
     def key(self):
-        """Name used by vino_getgeo in file names, e.g. 2t, tp24."""
+        """Name used in file names, e.g. 2t, tp24, t850."""
+        if self.upper:
+            return f"{self.param}{self.level}"
         return f"{self.param}{self.period}" if self.period else self.param
 
 
@@ -329,7 +364,13 @@ class Config:
         self.store = Path(os.path.expandvars(str(c["store"] or SCRIPT.parent / "store"))).expanduser().resolve()
         self.times = expand_ints(c["times"])
         self.steps = expand_ints(c["steps"])
-        self.params = [Param(p) for p in c["parameters"]]
+        self.params = [q for p in c["parameters"] for q in Param.expand(p)]
+        if len({p.key for p in self.params}) != len(self.params):
+            sys.exit("a parameter is configured twice")
+        self.upper = c["upper_air"]
+        self.upper["sources"] = tokens(self.upper["sources"])
+        if self.upper["interpolation"] not in ("nearest_point", "bilinear"):
+            sys.exit("upper_air.interpolation must be nearest_point or bilinear")
         self.tools = {k: os.path.expanduser(v) for k, v in c["tools"].items()}
         # named verification periods (e.g. DJF, JJA); plain `dates` is one period "all".
         # An end date "-" (e.g. 20241201/to/-/by/1) means: up to the last date in MARS.
@@ -372,6 +413,11 @@ class Config:
                     sys.exit(f"experiment {e['label']}: type pf needs `numbers` (e.g. 1/to/50)")
                 if spec["control"] and spec["type"] != "pf":
                     sys.exit(f"experiment {e['label']}: `control: true` needs type pf")
+            if any(p.upper for p in self.params):
+                for spec, _ in e["variants"]:
+                    if not (spec["grid"] or self.upper["grid"]):
+                        sys.exit(f"experiment {e['label']}: pressure-level parameters need a MARS "
+                                 "grid, set upper_air.grid (e.g. O1280) or the experiment's grid")
             e["by_date"] = {d: spec for spec, ds in e["variants"] for d in ds}
             self.experiments.append(e)
         labels = [e["label"] for e in self.experiments]
@@ -456,14 +502,22 @@ class Config:
         return [(spec, sorted(ds)) for spec, ds in groups.values()]
 
     # ---- paths
-    @property
-    def obs_dir(self):
-        return self.store / "obs" / "_".join(self.sources)
+    def obs_dir(self, p):
+        return self.store / "obs" / "_".join(self.upper["sources"] if p.upper else self.sources)
 
-    def fc_dir(self, spec):
+    def fc_dir(self, spec, p=None):
         """Store directory of one experiment variant. It is named after
         everything that defines the data (not the run-specific label), so
-        all configs that use the same forecasts share it."""
+        all configs that use the same forecasts share it. Pressure-level
+        parameters (p.upper) are always collocated locally by vino_upper.py."""
+        if p is not None and p.upper:
+            parts = ["upper", spec["class"], spec["stream"], spec["expver"], spec["type"]]
+            for k in ("anoffset", "origin", "numbers"):
+                if spec[k] not in (None, ""):
+                    parts.append(f"{k}{spec[k]}")
+            parts += [f"grid{spec['grid'] or self.upper['grid']}",
+                      f"{self.upper['interpolation']}_{'_'.join(self.upper['sources'])}"]
+            return self.store.joinpath("fc", *(str(x).replace("/", "x").replace(" ", "") for x in parts))
         if spec["collocate"] == "vino":
             parts = ["vino", spec["class"], spec["stream"], vino_expver(spec), spec["type"]]
         else:
@@ -484,7 +538,7 @@ class Config:
         spec = e["by_date"].get(d)
         if not spec:
             return None
-        files = [fc_file(self.fc_dir(ds), p, d, t, s) for ds in data_specs(spec)]
+        files = [fc_file(self.fc_dir(ds, p), p, d, t, s) for ds in data_specs(spec)]
         return None if None in files else files
 
     def store_lock(self, root, name):
@@ -520,7 +574,7 @@ def day_dir(root, d):
 
 
 def obs_file(cfg, p, vt):
-    return day_dir(cfg.obs_dir, vt.date()) / f"{p.key}_obs_{vt:%Y%m%d%H}.geo"
+    return day_dir(cfg.obs_dir(p), vt.date()) / f"{p.key}_obs_{vt:%Y%m%d%H}.geo"
 
 
 def fc_file(root, p, d, t, s):
@@ -600,6 +654,8 @@ def stage_upload(cfg, args):
                 if not uploads(spec):
                     continue
                 for p in cfg.params:
+                    if p.upper:  # not in VINO; collocated locally
+                        continue
                     if not cfg.steps_for(p):
                         log(f"{p.key}: no steps >= period {p.period}, skipped")
                         continue
@@ -683,6 +739,8 @@ def genfc_cmd(cfg, exp, p, t, dates, steps):
             cmd += [f"--{k}", exp[k]]
     if exp["numbers"] not in (None, ""):
         cmd += ["--numbers", "/".join(tokens(exp["numbers"]))]
+    if exp["database"]:
+        cmd += ["--mars_database", exp["database"]]
     if g.get("ignore_missing"):
         cmd.append("--ignore_missing")
     if g.get("get_orog_once"):
@@ -696,20 +754,25 @@ def genfc_cmd(cfg, exp, p, t, dates, steps):
 # collocate (vino_genfc -> geopoint files, no VINO upload)
 # --------------------------------------------------------------------------
 
-def collocated(spec):
-    return spec["collocate"] == "local"
+def collocated(spec, p=None):
+    """Collocated locally: collocate: local, and every pressure-level parameter."""
+    return spec["collocate"] == "local" or (p is not None and p.upper)
+
+
+def collocates(cfg, e):
+    return any(collocated(s) for s, _ in e["variants"]) or any(p.upper for p in cfg.params)
 
 
 def stage_collocate(cfg, args):
-    exps = [e for e in cfg.experiments if any(collocated(s) for s, _ in e["variants"])]
+    exps = [e for e in cfg.experiments if collocates(cfg, e)]
     if args.experiment:
         exps = [e for e in exps if e["label"] in args.experiment]
     if not exps:
         log("nothing to collocate (no experiments with collocate: local selected)")
         return 0
     tasks = [(spec, dates, p, t) for e in exps for vs, dates in e["variants"]
-             for spec in data_specs(vs) if collocated(spec)
-             for p in cfg.params if cfg.steps_for(p) for t in cfg.times]
+             for spec in data_specs(vs)
+             for p in cfg.params if cfg.steps_for(p) and collocated(spec, p) for t in cfg.times]
     failures = []
     for missing in parallel_map(cfg, lambda a: collocate_set(cfg, args.force, *a), tasks):
         failures += missing
@@ -724,11 +787,24 @@ def stage_collocate(cfg, args):
 def collocate_set(cfg, force, spec, dates, p, t):
     """Collocate the dates of one (experiment variant, parameter, time) that
     are not in the store yet; return the ones still missing."""
-    root = cfg.fc_dir(spec)
+    root = cfg.fc_dir(spec, p)
     steps = cfg.steps_for(p)
+    to_store = upper_to_store if p.upper else genfc_to_store
+    if p.upper:
+        # the forecasts are picked at the stations of the observations, so
+        # these must be in the store first
+        needed = defaultdict(set)
+        for d in dates:
+            for s in steps:
+                vt = valid_time(d, t, s)
+                needed[vt.hour].add(vt.date())
+        for hour, ds in sorted(needed.items()):
+            download_obs(cfg, p, hour, ds)
 
     def complete(d):
-        return all(fc_file(root, p, d, t, s) for s in steps)
+        # pressure levels: only steps with observations can be collocated
+        return all(fc_file(root, p, d, t, s) for s in steps
+                   if not p.upper or obs_file(cfg, p, valid_time(d, t, s)).exists())
 
     with cfg.store_lock(root, f"{p.key}_{t:02d}"):
         todo = list(dates) if force else [d for d in dates if not complete(d)]
@@ -736,13 +812,13 @@ def collocate_set(cfg, force, spec, dates, p, t):
             f"already in the store, {len(todo)} to collocate")
         failed = []
         for chunk in chunks(todo, cfg.chunk_size):
-            if genfc_to_store(cfg, spec, p, t, chunk, steps) == 0:
+            if to_store(cfg, spec, p, t, chunk, steps) == 0:
                 continue
             # vino_genfc stops at the first error; redo the dates one at a time
             if len(chunk) > 1:
                 log(f"[{spec['label']} {p.key} {t:02d}z] retrying "
                     f"{ymd(chunk[0])}-{ymd(chunk[-1])} one date at a time")
-                failed += [d for d in chunk if genfc_to_store(cfg, spec, p, t, [d], steps)]
+                failed += [d for d in chunk if to_store(cfg, spec, p, t, [d], steps)]
             else:
                 failed += chunk
         missing = [d for d in todo if d in failed or not complete(d)]
@@ -776,6 +852,32 @@ def genfc_to_store(cfg, spec, p, t, dates, steps):
     return 0
 
 
+def upper_cmd(*args):
+    """Command line of vino_upper.py, run with the modules it needs."""
+    return ["bash", "-c", f'{UPPER_ENV}; exec python3 "$0" "$@"',
+            SCRIPT.with_name("vino_upper.py"), *args]
+
+
+def upper_to_store(cfg, spec, p, t, dates, steps):
+    """Collocate a pressure-level parameter with vino_upper.py into the store."""
+    a = ["fc", "--parameter", p.param, "--level", p.level, "--key", p.key,
+         "--dates", *map(ymd, dates), "--time", t, "--steps", *steps,
+         "--class", spec["class"], "--stream", spec["stream"], "--expver", spec["expver"],
+         "--type", spec["type"], "--grid", spec["grid"] or cfg.upper["grid"],
+         "--interpolation", cfg.upper["interpolation"], "--obsdir", cfg.obs_dir(p),
+         "--mars", cfg.tools["mars"]]
+    for k in ("anoffset", "origin", "database"):
+        if spec[k] not in (None, ""):
+            a += [f"--{k}", spec[k]]
+    if spec["numbers"] not in (None, ""):
+        a += ["--numbers", "/".join(map(str, expand_ints(spec["numbers"])))]
+    with cfg.store_tmp() as tmp:
+        rc = run(upper_cmd(*a, "--outdir", tmp))
+        if rc == 0:
+            move_into(tmp, cfg.fc_dir(spec, p))
+    return rc
+
+
 def genfc_geo_to_store(src, target, p, spec, base, step):
     """Copy a vino_genfc geopoint file and add the metadata vino_getgeo
     files carry. The values and units are the same as in VINO."""
@@ -806,7 +908,7 @@ def stage_download(cfg, args):
             for exp in cfg.experiments:
                 tasks += [(download_fc, (cfg, spec, vdates, p, t))
                           for vs, vdates in exp["variants"] for spec in data_specs(vs)
-                          if spec["collocate"] == "vino"
+                          if not collocated(spec, p)
                           for t in cfg.times]
         log(f"checking {len(tasks)} observation/forecast sets, {cfg.parallel} at a time")
         parallel_map(cfg, lambda task: task[0](*task[1]), tasks)
@@ -835,7 +937,7 @@ def obs_needed(cfg, p):
 
 
 def download_obs(cfg, p, hour, dates):
-    root = cfg.obs_dir
+    root = cfg.obs_dir(p)
     with cfg.store_lock(root, f"{p.key}_{hour:02d}"):
         todo = [d for d in sorted(dates)
                 if not obs_file(cfg, p, dt.datetime(d.year, d.month, d.day, hour)).exists()]
@@ -843,6 +945,11 @@ def download_obs(cfg, p, hour, dates):
             return
         log(f"[obs {p.key} {hour:02d}z] {len(todo)} files to download")
         for chunk in chunks(todo, cfg.chunk_size * 4):
+            if p.upper:
+                fetch(cfg, upper_cmd("obs", "--parameter", p.param, "--level", p.level, "--key", p.key,
+                                     "--dates", *map(ymd, chunk), "--hour", hour,
+                                     "--sources", *cfg.upper["sources"]), root)
+                continue
             cmd = [cfg.tools["getgeo"], "--parameter", p.param,
                    "--dates", *map(ymd, chunk), "--times", hour, "--sources", *cfg.sources]
             if p.period:
@@ -881,6 +988,9 @@ def print_status(cfg):
         for vs, _ in exp["variants"]:
             for spec in data_specs(vs):
                 print(f"  {exp['label']} {spec['expver']} {spec['type']}: {cfg.fc_dir(spec)}")
+                if any(p.upper for p in cfg.params):
+                    print(f"  {exp['label']} {spec['expver']} {spec['type']} (pressure levels): "
+                          f"{cfg.fc_dir(spec, next(p for p in cfg.params if p.upper))}")
 
 
 def stage_status(cfg, args):
@@ -995,6 +1105,10 @@ def matched(cfg, p, step, dates=None):
                     # model surface above the station -> station is warmer
                     m[members[lab]] = m[members[lab]].add(lapse * (m[f"z_{lab}"] - m["z_obs"]), axis=0)
             m = m.dropna(subset=need)
+            if p.param == "z" and p.upper:  # geopotential -> geopotential height
+                cols = ["obs"] + [c for lab in labels for c in members[lab]]
+                m[cols] = m[cols] / G
+                units = "gpm"
             obs_v = m["obs"].to_numpy(float)
             for lab in labels:
                 ens = m[members[lab]].to_numpy(float)
@@ -1012,7 +1126,7 @@ def matched(cfg, p, step, dates=None):
 
 def error(p, fc, obs):
     e = fc - obs
-    if p.param == "10dd":  # wind direction: shortest angular difference
+    if p.param in ANGLE_PARAMS:  # wind direction: shortest angular difference
         e = (e + 180.0) % 360.0 - 180.0
     return e
 
@@ -1021,7 +1135,7 @@ def ens_mean(p, ens):
     """Ensemble mean of the members (columns of ens); circular for 10dd."""
     if ens.shape[1] == 1:
         return ens[:, 0]
-    if p.param == "10dd":
+    if p.param in ANGLE_PARAMS:
         r = np.deg2rad(ens)
         return np.rad2deg(np.arctan2(np.sin(r).mean(1), np.cos(r).mean(1))) % 360.0
     return ens.mean(1)
@@ -1035,7 +1149,7 @@ def fair_crps(p, ens, obs):
     skill = np.abs(error(p, ens, obs[:, None])).mean(1)
     if m == 1:
         return skill
-    if p.param == "10dd":
+    if p.param in ANGLE_PARAMS:
         spread = np.abs(error(p, ens[:, :, None], ens[:, None, :])).sum((1, 2)) / 2
     else:
         # sum_{i<j} |x_i - x_j| = sum_k (2k - m - 1) x_(k) over the sorted members
@@ -1637,7 +1751,7 @@ def stage_submit(cfg, args):
                 upload_ids.append(sbatch(job, [], args.dry_run))
     if "collocate" in stages:
         for exp in cfg.experiments:
-            if any(collocated(s) for s, _ in exp["variants"]):
+            if collocates(cfg, exp):
                 job = write_job(cfg, f"{cfg.name}_collocate_{exp['label']}", "collocate",
                                 f"--experiment {exp['label']}{force}")
                 collocate_ids.append(sbatch(job, [], args.dry_run))
