@@ -13,9 +13,9 @@ experiments with observations, built on the VINO tools:
    `model`) and the verifying observations (table `observation`) as Metview
    geopoint files.
 3. **plot**: pairs each forecast with the observations at its valid time and
-   draws station maps of bias, RMSE and MAE, maps of RMSE/MAE differences
-   against a reference experiment, and score-vs-step curves. It then writes
-   an `index.html` page for browsing all of them.
+   draws station maps of bias, RMSE and MAE, maps of mean bias (MEF), RMSE and
+   MAE differences against a reference experiment, and score-vs-step curves.
+   It then writes an `index.html` page for browsing all of them.
 
 Each stage runs as a Slurm job, and each one can be rerun safely: anything
 already done is skipped, so you can add dates or parameters to the config
@@ -157,8 +157,9 @@ uploaded or downloaded; observations still come from VINO through
   exist for **every** experiment are used, so all experiments are scored on
   the same sample.
 * Per-station statistics over all base dates/times: bias (fc − obs), RMSE and
-  MAE. RMSE and MAE differences are each experiment minus the reference
-  (the first experiment). **Red = worse than the reference.** As in quaver's
+  MAE. MEF, RMSE and MAE differences are each experiment minus the reference
+  (the first experiment). For RMSE/MAE differences, **red = worse than the
+  reference**. As in quaver's
   `error_map`, a station is used only when it has valid pairs for at least
   `plot.min_fraction` (default 0.5) of the forecasts.
 * Regional scores (scores.png, browser table) are unweighted means of the
@@ -188,11 +189,16 @@ uploaded or downloaded; observations still come from VINO through
   reference per station, `100 * (RMSE_exp / RMSE_ref - 1)` in %, so negative
   (blue) is better. The colour scale is capped at ±100 %.
 * `scores.png` shows the bias/RMSE/MAE of all experiments against forecast
-  step, averaged over all pairs in the region, plus the relative RMSE change
-  against the reference.
+  step, averaged over all pairs in the region, plus the mean bias difference
+  (MEF) and relative RMSE change against the reference.
 * With `plot.daily_maps: true` the script also draws the observed values and
   each experiment's error for every single forecast. That produces
   dates × times × steps × (experiments + 1) images per region.
+* With `plot.valid_hours: [0, 12]` every period gets extra periods (e.g.
+  `DJF_00UTC`, `DJF_12UTC`, selectable in the browser) using only the
+  forecasts valid at that hour (UTC), as an indication of the diurnal cycle.
+  Each step then needs base times that reach those valid hours (e.g. `times:
+  [0, 12]` with steps 24/to/240/by/48).
 * The images used for each map are fingerprinted in `plots/signatures.json`,
   and an image is redrawn only when its data or colour scale changes.
   Appending dates therefore redraws the summary maps, and only the new daily
@@ -200,8 +206,9 @@ uploaded or downloaded; observations still come from VINO through
 
 ### HTML browser (`<workdir>/index.html`)
 
-* Selectors for parameter, region, view (Bias / RMSE / MAE / RMSE difference /
-  MAE difference / Relative RMSE change / Model − station height / Scores vs step / Single forecasts) and forecast step.
+* Selectors for parameter, region, view (Bias / MEF / RMSE / MAE / RMSE
+  difference / MAE difference / Relative RMSE change / Model − station height /
+  Scores vs step / Single forecasts) and forecast step.
   With ensembles there are also Fair CRPS / FCRPS difference / Relative FCRPS
   change views, and FCRPS columns in the table.
   Use the slider, the ◀ ▶ buttons or the ← → keys to change the step.
@@ -350,10 +357,62 @@ Experiments can use different settings in different periods but keep one
 label (and so one line in the plots): give any setting as `{period: value}`,
 e.g. `expver: {DJF: abcd, JJA: efgh}`. Every period must be listed.
 
+## Observations from MARS feedback
+
+The surface observations can come from the feedback (ODB) of an assimilation in
+MARS instead of VINO, using all of its stations:
+
+```yaml
+observations:
+  source: mars
+  mars: {class: od, expver: 1, stream: lwda, type: ofb, obsgroup: conv}
+```
+
+* The observations are retrieved for every assimilation window the valid times
+  need (one MARS request per analysis time and chunk of dates, about a minute
+  per window), and written as one geopoint file per parameter and valid time to
+  `<store>/obs/ofb_.../`. The directory name holds all settings, so different
+  selections don't mix.
+* Reports within `tolerance` minutes (default 30) of the valid hour are used,
+  the closest one per station (active ones first if equally close). The window
+  of analysis time T is (T + `window[0]`, T + `window[1]`] hours, by default
+  that of the 12-hour 4D-Var of `lwda`. Change `window` and `window_times`
+  for other streams.
+* `obstype` (default 1, SYNOP incl. SHIP and METAR), `codetype` (e.g.
+  `[11, 14]` for land SYNOP only) and `active_only` select the reports.
+* The forecasts of every experiment (also `collocate: vino` ones) are picked at
+  the stations of the observation file valid at each step by `vino_upper.py`
+  in the `collocate` stage, which first retrieves the observations it needs.
+  They are taken at the nearest grid point of the native grid (or the
+  experiment's `grid`) and go to `<store>/fc/ofb/.../`. Nothing is uploaded to
+  or downloaded from VINO for these parameters.
+* The model height at the stations (for the height correction and `max_dz`) is
+  z at step 0 of the forecast, or the file given with `--orog_from_file` in
+  `genfc.extra_args` / `genfc_args`. The station height is the one in the
+  feedback.
+* Available are 2t, 2d, 10ff, 10dd, 10u and 10v (ODB varno 39, 40, 112, 111, 41,
+  42) with `interpolation: nearest_point`. Accumulated parameters are not.
+* Upper-air parameters (see below) then also come from the feedback: radiosonde
+  reports (`upper_air.obstype`, default 5 = TEMP) at the standard pressure
+  levels, ODB varno 2 (t), 1 (z), 112 (ff), 111 (dd) and 59 (td), in
+  `<store>/obs/ofbtemp_.../`. Their time is the launch time (about an hour
+  before the nominal hour), so the closest report within
+  `upper_air.tolerance` minutes (default 90) is used. Surface and upper-air
+  reports are retrieved in the same MARS request, and they are told apart by
+  obstype, so the two obstype lists must not overlap:
+
+  ```yaml
+  observations:
+    source: mars
+    upper_air: {obstype: [5], codetype: null, tolerance: 90}
+  ```
+* Reading the feedback needs `pyodc` (in the `python3` module).
+
 ## Upper-air (TEMP) parameters
 
-Radiosonde observations from the VINO `temp` data set can be verified like the
-SYNOP parameters. Give the pressure levels (hPa) of a parameter:
+Radiosonde observations from the VINO `temp` data set (or, with
+`observations.source: mars`, from the MARS feedback, see above) can be
+verified like the SYNOP parameters. Give the pressure levels (hPa) of a parameter:
 
 ```yaml
 parameters:

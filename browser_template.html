@@ -79,6 +79,7 @@ const ENS = "fcrps" in M.metrics;  // ensemble experiments: fair CRPS views
 
 const VIEWS = [
   ["bias", "Bias (fc − obs)", EXPS],
+  ["mef", `MEF (mean bias difference vs ${REF})`, OTHERS],
   ["rmse", "RMSE", EXPS],
   ["mae", "MAE", EXPS],
   ["rmsediff", `RMSE difference vs ${REF}`, OTHERS],
@@ -159,7 +160,8 @@ function render() {
   } else {
     const exps = VIEWS.find(v => v[0] === view)[2];
     html = exps.map(e => fig(`${dir}/${view}_${e}_T${pad3(s)}.png`,
-      view.endsWith("diff") ? `${e} − ${REF}` : view.endsWith("rel") ? `${e} vs ${REF}` : e)).join("");
+      view.endsWith("diff") || view === "mef" ? `${e} − ${REF}`
+        : view.endsWith("rel") ? `${e} vs ${REF}` : e)).join("");
   }
   $("figs").innerHTML = html;
   renderTable(p, s);

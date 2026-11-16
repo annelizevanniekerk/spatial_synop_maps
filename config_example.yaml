@@ -75,6 +75,20 @@ experiments:
 
 sources: [synop]               # VINO observation sources
 interpolation: nearest_point   # nearest_point | nearest_land_point | nearest_sea_point
+
+# Surface observations: from VINO (default) or from the MARS feedback of an
+# assimilation (ODB, type ofb). With mars, the forecasts of all experiments are
+# picked at the feedback stations in the collocate stage (no VINO involved).
+# Available parameters: 2t, 2d, 10ff, 10dd, 10u, 10v (interpolation: nearest_point).
+# observations:
+#   source: mars               # vino | mars
+#   mars: {class: od, expver: 1, stream: lwda, type: ofb, obsgroup: conv}
+#   window: [-3, 9]            # hours of the window of each analysis time (lwda 12h 4D-Var)
+#   window_times: [0, 12]
+#   tolerance: 30              # minutes around the valid hour; the closest report is used
+#   obstype: [1]               # 1 = SYNOP (land, ship, METAR)
+#   codetype: null             # e.g. [11, 14]: land SYNOP only
+#   active_only: false         # only observations active in the assimilation
 chunk_size: 15                 # dates per vino_genfc / vino_getgeo call
 parallel: 4                    # concurrent vino_genfc / vino_getgeo calls
 
@@ -95,6 +109,7 @@ plot:
     europe: [-25, 45, 33, 72]
   min_fraction: 0.5            # station needs valid pairs for >= this fraction of forecasts
   daily_maps: false            # also draw maps for every single forecast (many images!)
+  # valid_hours: [0, 12]       # extra periods (e.g. DJF_00UTC) with only forecasts valid at these UTC hours
   processes: 4                 # used when not running under slurm
   dpi: 150
   lapse_rate: 0.0065           # K/m, corrects 2t forecasts to station height (0 = off)

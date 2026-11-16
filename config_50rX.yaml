@@ -19,7 +19,7 @@ periods:
   DJF: 20241201/to/-/by/1
   JJA: 20240601/to/-/by/1
 times: [0, 12]
-steps: 24/to/240/by/48
+steps: 24/to/240/by/24
 
 # Parameters (MARS names as understood by vino_genfc / vino_getgeo).
 # Accumulated / extreme parameters need a period in hours; steps shorter than
@@ -83,8 +83,11 @@ plot:
   regions:                     # name: [west, east, south, north] or null for global
     global: null
     europe: [-25, 45, 33, 72]
+    north_america: [-170, -50, 15, 75]
+
   min_fraction: 0.5            # station needs valid pairs for >= this fraction of forecasts
   daily_maps: false            # also draw maps for every single forecast (many images!)
+  valid_hours: [0, 12]         # extra periods (e.g. DJF_00UTC) with only forecasts valid at these UTC hours
   processes: 4                 # used when not running under slurm
   dpi: 150
   lapse_rate: 0.0065           # K/m, corrects 2t forecasts to station height (0 = off)
