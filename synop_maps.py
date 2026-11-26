@@ -13,7 +13,7 @@ Stages (each can be rerun safely; work already done is skipped):
                              (always local, for every experiment)
     download  vino_getgeo  : VINO -> local geopoint files (obs + forecasts);
                              TEMP observations with vino_upper.py;
-                             with observations.source: mars the SYNOP
+                             with observations.source: mars (default) the SYNOP
                              observations come from MARS feedback (type ofb)
                              and the forecasts are picked at its stations by
                              vino_upper.py in the collocate stage
@@ -79,6 +79,9 @@ OFB_VARNO = {"2t": 39, "2d": 40, "10u": 41, "10v": 42, "10dd": 111, "10ff": 112}
 # ODB varno of the pressure-level parameters (TEMP) in MARS feedback; z is geopotential
 OFB_UPPER_VARNO = {"z": 1, "t": 2, "td": 59, "dd": 111, "ff": 112}
 UPPER_ENV = "module load python3 ecmwf-toolbox vtb/vino >/dev/null 2>&1"
+# MARS read buffer: one tco3999 GRIB field is ~128 MB, above the 64 MB default.
+# Set here so every MARS call made by this script and its sub-tools inherits it.
+os.environ.setdefault("MARS_READANY_BUFFER_SIZE", str(1024 * 1024 * 1024))
 
 DEFAULTS = {
     "name": "synop_maps",
@@ -88,7 +91,7 @@ DEFAULTS = {
     "times": [0],
     "sources": ["synop"],
     "observations": {
-        "source": "vino",  # vino | mars: surface observations from VINO or MARS feedback
+        "source": "mars",  # mars | vino: surface observations from MARS feedback (ODB) or VINO
         # MARS feedback request (source: mars); time and date are added per window
         "mars": {"class": "od", "expver": 1, "stream": "lwda", "type": "ofb", "obsgroup": "conv"},
         "window": [-3, 9],  # assimilation window of each `window_times` analysis, in hours
@@ -129,7 +132,17 @@ DEFAULTS = {
         "dpi": 150,
         "lapse_rate": 0.0065,  # K/m, height correction of 2t forecasts to station height
         "max_dz": 250,  # m, drop stations where |model - station elevation| exceeds this
+        # weights of the stations in the regional scores (quaver spatial_mean_weights):
+        # none (all equal) | station_density (1 / Gaussian-kernel station density, so
+        # each station of a dense network counts less), kernel width scangle in degrees
+        "spatial_mean_weights": "station_density",
+        "scangle": 0.75,
         "valid_hours": [],  # e.g. [0, 12]: extra periods with only these valid hours (UTC)
+        # station identifier classes (see station_class): wmo (numeric WMO block/station
+        # number), icao (4 letters, METAR), noid (no identifier: '_' + hash in the ODB,
+        # e.g. national networks), other (ships, mobile, 7-character call signs)
+        "station_ids": None,  # classes to keep everywhere, e.g. [wmo, icao]; null = all
+        "station_groups": {},  # extra periods per group, e.g. {wmo: [wmo], noid: [noid]}
     },
     "publish": {
         "site": None,  # e.g. https://sites.ecmwf.int/<user>/<site>/ ; null = do not publish
@@ -160,7 +173,8 @@ EXP_DEFAULTS = {
     "expver_label": None,
     "grid": None,
     "resol": None,
-    "database": None,  # alternative MARS database, e.g. fdb for data not archived yet
+    "database": None,  # alternative MARS database, e.g. fdb for data not archived yet;
+    # mars+fdb: each date from MARS, and from the FDB where MARS does not have it
     "genfc_args": [],
 }
 
@@ -297,6 +311,22 @@ OPEN_END = "-"
 MAX_GAP = 7  # days; an open period ends at the first longer gap in the MARS dates
 
 
+MARS_FDB = "mars+fdb"  # `database` value: MARS first, the FDB for the dates MARS lacks
+
+
+def db_attempts(spec):
+    """The specs to retrieve an experiment with, in order: with
+    `database: mars+fdb` first from MARS, then from the FDB."""
+    if spec.get("database") == MARS_FDB:
+        return [dict(spec, database=None), dict(spec, database="fdb")]
+    return [spec]
+
+
+def db_where(e):
+    db = e.get("database")
+    return "MARS" if not db else "MARS+FDB" if db == MARS_FDB else "FDB" if db == "fdb" else f"database {db}"
+
+
 def period_spec(e, per):
     """Experiment settings for one period (values given as {period: value} resolved)."""
     return {k: ({str(a): b for a, b in v.items()}.get(per) if isinstance(v, dict) else v)
@@ -306,6 +336,11 @@ def period_spec(e, per):
 def list_dates(cfg, e, t, step, start, cap):
     """Base dates in [start, cap] at time t for which experiment e has 2t at step.
     None if the listing failed."""
+    if e.get("database") == MARS_FDB:
+        found = [list_dates(cfg, sp, t, step, start, cap) for sp in db_attempts(e)]
+        if all(f is None for f in found):
+            return None
+        return sorted({d for f in found if f for d in f})
     req = {"class": e["class"], "stream": e["stream"], "expver": e["expver"],
            "type": e["type"], "levtype": "sfc", "param": "167", "time": f"{t:02d}00",
            "step": step}
@@ -351,7 +386,7 @@ def mars_last_date(cfg, e, start):
         # the first gap of more than MAX_GAP days, so that e.g. a run of the
         # same expver in another year does not extend the period
         if not dates or (dates[0] - start).days > MAX_GAP:
-            where = "FDB" if e.get("database") else "MARS"
+            where = db_where(e)
             log(f"{e.get('label', e['expver'])} ({e['expver']}) {t:02d}z: no forecasts in {where} from "
                 f"{ymd(start)}" + (f" (first date found {ymd(dates[0])})" if dates else ""))
             return None
@@ -372,6 +407,15 @@ class Param:
         self.period = int(d.get("period", 0) or 0)
         self.level = level  # pressure level in hPa (TEMP), None for surface parameters
         self.local = self.upper  # collocated by vino_upper.py at the stations of the obs files
+        # observation source of this parameter (vino | mars); None: observations.source
+        self.obs = d.get("obs")
+        if self.obs not in (None, "vino", "mars"):
+            sys.exit(f"{self.param}: obs must be vino or mars")
+        self.mars = False  # observations from MARS feedback (set by Config)
+        # SEEPS (Rodwell et al. 2010) with the station climatology Quaver uses
+        self.seeps = bool(d.get("seeps", False))
+        if self.seeps and (self.param != "tp" or self.period != 24 or level is not None):
+            sys.exit(f"{self.param}: seeps is available for tp with period: 24 only")
         if level is not None and self.param not in UPPER_PARAMS:
             sys.exit(f"{self.param}: pressure levels are available for {sorted(UPPER_PARAMS)} only")
         default = f"{self.param} {level} hPa" if level is not None else self.key
@@ -434,15 +478,17 @@ class Config:
         if self.obs["source"] not in ("vino", "mars"):
             sys.exit("observations.source must be vino or mars")
         self.interpolation = c["interpolation"]
-        if self.obs["source"] == "mars":
+        for p in self.params:
+            p.mars = (p.obs or self.obs["source"]) == "mars"
+        if self.obs_mars:
             if self.interpolation != "nearest_point":
                 sys.exit("observations.source: mars needs interpolation: nearest_point")
             self.obs["upper_air"]["obstype"] = tokens(self.obs["upper_air"]["obstype"])
             # reports are told apart by obstype (ff/dd share their varno with 10ff/10dd)
-            if (any(p.upper for p in self.params) and any(not p.upper for p in self.params)
+            if (any(p.upper for p in self.mars_params) and any(not p.upper for p in self.mars_params)
                     and set(tokens(self.obs["obstype"])) & set(self.obs["upper_air"]["obstype"])):
                 sys.exit("observations.obstype and observations.upper_air.obstype must not overlap")
-            for p in self.params:
+            for p in self.mars_params:
                 if p.upper and p.param not in OFB_UPPER_VARNO:
                     sys.exit(f"{p.key}: not available with observations.source: mars "
                              f"(pressure levels: {sorted(OFB_UPPER_VARNO)})")
@@ -490,7 +536,9 @@ class Config:
             sys.exit("no experiments configured")
         # ensemble experiments add fair CRPS maps and scores
         self.ensemble = any(spec["type"] == "pf" for e in self.experiments for spec, _ in e["variants"])
-        self.metrics = {m: v for m, v in METRICS.items() if self.ensemble or not m.startswith("fcrps")}
+        self.metrics = {m: v for m, v in METRICS.items()
+                        if (self.ensemble or not m.startswith("fcrps"))
+                        and (any(p.seeps for p in self.params) or not m.startswith("seeps"))}
 
     def resolve_open_ends(self, raw_periods, experiments, refresh):
         """{period: end date} for periods whose end is "-": the last base date
@@ -524,7 +572,7 @@ class Config:
         for per, (start, exps, key) in todo.items():
             last = [d for (p, _), d in zip(queries, found) if p == per]
             for e, d in zip(exps, last):
-                where = "FDB" if e.get("database") else "MARS"
+                where = db_where(e)
                 log(f"period {per}: {e.get('label', e['expver'])} ({e['expver']}) "
                     + (f"is in {where} up to {ymd(d)}" if d else
                        f"NOT usable: no step {max(self.steps)} from {ymd(start)} at every "
@@ -571,11 +619,16 @@ class Config:
     # ---- paths
     @property
     def obs_mars(self):
-        """True when the surface observations come from MARS feedback."""
-        return self.obs["source"] == "mars"
+        """True when any parameter's observations come from MARS feedback."""
+        return any(p.mars for p in self.params)
+
+    @property
+    def mars_params(self):
+        """Parameters whose observations come from MARS feedback."""
+        return [p for p in self.params if p.mars]
 
     def obs_dir(self, p):
-        if self.obs_mars:
+        if p.mars:
             # named after everything that selects the observations
             o = self.obs
             sel = o["upper_air"] if p.upper else o
@@ -651,14 +704,25 @@ class Config:
         return self.workdir / "plots"
 
     def plot_periods(self):
-        """{name: (dates, valid hour or None)}: the periods, plus one per period
-        and plot.valid_hours entry (e.g. DJF_00UTC) with only the forecasts
-        valid at that hour (UTC), for a view of the diurnal cycle."""
-        out = {per: (ds, None) for per, ds in self.periods.items()}
+        """{name: (dates, valid hour or None, station classes or None)}: the
+        periods, plus one per period and plot.valid_hours entry (e.g. DJF_00UTC)
+        with only the forecasts valid at that hour (UTC), for a view of the
+        diurnal cycle, and one per plot.station_groups entry for each of these
+        (e.g. DJF_wmo, DJF_00UTC_wmo) with only stations of those classes."""
+        hours = [None] + expand_ints(self.plot["valid_hours"] or [])
+        groups = [(None, None)] + [(g, list(c)) for g, c in (self.plot["station_groups"] or {}).items()]
+        for g, c in groups[1:]:
+            bad = set(c) - set(STATION_CLASSES)
+            if bad:
+                raise SystemExit(f"plot.station_groups.{g}: unknown station class(es) {sorted(bad)}, "
+                                 f"use {list(STATION_CLASSES)}")
+        out = {}
         for per, ds in self.periods.items():
-            for h in expand_ints(self.plot["valid_hours"] or []):
-                name = f"{h:02d}UTC" if per == "all" else f"{per}_{h:02d}UTC"
-                out[name] = (ds, h)
+            for h in hours:
+                for g, c in groups:
+                    parts = ([] if per == "all" and (h is not None or g) else [per]) \
+                        + ([] if h is None else [f"{h:02d}UTC"]) + ([g] if g else [])
+                    out["_".join(parts)] = (ds, h, c)
         return out
 
     def steps_for(self, p):
@@ -797,7 +861,23 @@ def stage_upload(cfg, args):
 
 
 def upload_chunk(cfg, exp, p, t, chunk):
-    """Upload one chunk of dates and return the dates still missing from VINO."""
+    """Upload one chunk of dates and return the (label, param, time, date)
+    still missing from VINO. With `database: mars+fdb` the dates MARS does
+    not have are uploaded from the FDB."""
+    todo = list(chunk)
+    attempts = db_attempts(exp)
+    for i, spec in enumerate(attempts):
+        if i:
+            log(f"[{exp['label']} {p.key} {t:02d}z] {len(todo)} dates not in MARS, "
+                "trying the FDB: " + " ".join(map(ymd, todo)))
+        todo = upload_dates(cfg, spec, p, t, todo, warn=i == len(attempts) - 1)
+        if not todo:
+            break
+    return [(exp["label"], p.key, t, ymd(d)) for d in todo]
+
+
+def upload_dates(cfg, exp, p, t, chunk, warn=True):
+    """Upload dates with vino_genfc and return those still missing from VINO."""
     steps = cfg.steps_for(p)
     rc = run(genfc_cmd(cfg, exp, p, t, chunk, steps))
     failed = []
@@ -822,10 +902,10 @@ def upload_chunk(cfg, exp, p, t, chunk):
                     f.unlink()
     present = in_vino(cfg, exp, p, t, chunk)
     missing = [d for d in chunk if d in failed or d not in present]
-    if missing:
+    if missing and warn:
         log(f"[{exp['label']} {p.key} {t:02d}z] WARNING rc={rc}, not in VINO after upload: "
             + " ".join(map(ymd, missing)))
-    return [(exp["label"], p.key, t, ymd(d)) for d in missing]
+    return missing
 
 
 def parallel_map(cfg, fn, items):
@@ -909,7 +989,7 @@ def collocate_set(cfg, force, spec, dates, p, t):
     root = cfg.fc_dir(spec, p)
     steps = cfg.steps_for(p)
     to_store = upper_to_store if p.local else genfc_to_store
-    if p.upper and not cfg.obs_mars:
+    if p.upper and not p.mars:
         # the forecasts are picked at the stations of the observations, so
         # these must be in the store first (MARS feedback: done in stage_collocate)
         needed = defaultdict(set)
@@ -929,18 +1009,26 @@ def collocate_set(cfg, force, spec, dates, p, t):
         todo = list(dates) if force else [d for d in dates if not complete(d)]
         log(f"[{spec['label']} {spec['expver']} {p.key} {t:02d}z] {len(dates) - len(todo)} dates "
             f"already in the store, {len(todo)} to collocate")
-        failed = []
-        for chunk in chunks(todo, cfg.chunk_size):
-            if to_store(cfg, spec, p, t, chunk, steps) == 0:
-                continue
-            # vino_genfc stops at the first error; redo the dates one at a time
-            if len(chunk) > 1:
-                log(f"[{spec['label']} {p.key} {t:02d}z] retrying "
-                    f"{ymd(chunk[0])}-{ymd(chunk[-1])} one date at a time")
-                failed += [d for d in chunk if to_store(cfg, spec, p, t, [d], steps)]
-            else:
-                failed += chunk
-        missing = [d for d in todo if d in failed or not complete(d)]
+        missing = todo
+        # with `database: mars+fdb` the dates MARS does not have come from the FDB
+        for i, sp in enumerate(db_attempts(spec)):
+            if not missing:
+                break
+            if i:
+                log(f"[{spec['label']} {p.key} {t:02d}z] {len(missing)} dates not in MARS, "
+                    "trying the FDB: " + " ".join(map(ymd, missing)))
+            failed = []
+            for chunk in chunks(missing, cfg.chunk_size):
+                if to_store(cfg, sp, p, t, chunk, steps) == 0:
+                    continue
+                # vino_genfc stops at the first error; redo the dates one at a time
+                if len(chunk) > 1:
+                    log(f"[{spec['label']} {p.key} {t:02d}z] retrying "
+                        f"{ymd(chunk[0])}-{ymd(chunk[-1])} one date at a time")
+                    failed += [d for d in chunk if to_store(cfg, sp, p, t, [d], steps)]
+                else:
+                    failed += chunk
+            missing = [d for d in missing if d in failed or not complete(d)]
     if missing:
         log(f"[{spec['label']} {p.key} {t:02d}z] WARNING not collocated: "
             + " ".join(map(ymd, missing)))
@@ -1090,7 +1178,7 @@ def download_obs(cfg, p, hour, dates):
 def mars_obs_missing(cfg):
     """Valid times for which an observation file from MARS feedback is missing."""
     missing = set()
-    for p in cfg.params:
+    for p in cfg.mars_params:
         missing |= {vt for hour, dates in obs_needed(cfg, p).items() for d in dates
                     for vt in [dt.datetime(d.year, d.month, d.day, hour)]
                     if not obs_file(cfg, p, vt).exists()}
@@ -1100,7 +1188,7 @@ def mars_obs_missing(cfg):
 def obs_tolerance(cfg):
     """Largest tolerance (minutes) of the observations this config uses."""
     tol = [float(cfg.obs["tolerance"])]
-    if any(p.upper for p in cfg.params):
+    if any(p.upper for p in cfg.mars_params):
         tol.append(float(cfg.obs["upper_air"]["tolerance"]))
     return max(tol)
 
@@ -1125,8 +1213,8 @@ def ofb_where(cfg):
     """SQL condition selecting the feedback reports of all parameters: SYNOP
     for the surface ones, radiosondes at the configured levels for the others."""
     o, conds = cfg.obs, []
-    sfc = [p for p in cfg.params if not p.upper]
-    upper = [p for p in cfg.params if p.upper]
+    sfc = [p for p in cfg.mars_params if not p.upper]
+    upper = [p for p in cfg.mars_params if p.upper]
     if sfc:
         c = (f"obstype in ({','.join(tokens(o['obstype']))}) and "
              f"varno in ({','.join(map(str, sorted({OFB_VARNO[p.param] for p in sfc})))})")
@@ -1160,7 +1248,7 @@ def download_obs_mars(cfg, vts):
     request per analysis time fetches all windows the valid times need."""
     import pyodc
     o = cfg.obs
-    params = cfg.params
+    params = cfg.mars_params
     with cfg.store_lock(cfg.store / "obs", f"mars_{vts[0]:%Y%m%d%H}"):
         vts = [vt for vt in vts if any(not obs_file(cfg, p, vt).exists() for p in params)]
         if not vts:
@@ -1284,9 +1372,9 @@ def print_status(cfg):
                 if any(p.upper for p in cfg.params):
                     print(f"  {exp['label']} {spec['expver']} {spec['type']} (pressure levels): "
                           f"{cfg.fc_dir(spec, next(p for p in cfg.params if p.upper))}")
-                if cfg.obs_mars and any(not p.upper for p in cfg.params):
+                if any(not p.upper for p in cfg.mars_params):
                     print(f"  {exp['label']} {spec['expver']} {spec['type']} (MARS feedback stations): "
-                          f"{cfg.fc_dir(spec, next(p for p in cfg.params if not p.upper))}")
+                          f"{cfg.fc_dir(spec, next(p for p in cfg.mars_params if not p.upper))}")
 
 
 def stage_status(cfg, args):
@@ -1336,6 +1424,26 @@ def read_geo(path):
     return df[["stnid", "latitude", "longitude", "elevation"] + vals], meta
 
 
+STATION_CLASSES = ("wmo", "icao", "noid", "other")
+
+
+def station_class(ids):
+    """Identifier class of station ids (as in the store: WMO numbers without
+    leading zeros): wmo = digits only, icao = 4 letters (METAR), noid = no
+    identifier (the ODB gives these reports '_' + a hash, e.g. national
+    networks reported without a WMO number), other = anything else (ships,
+    mobile stations)."""
+    ids = pd.Series(ids, dtype=str)
+    return pd.Series(np.select([ids.str.fullmatch(r"\d+"), ids.str.fullmatch(r"[A-Z]{4}"),
+                                ids.str.startswith("_") | (ids.str.strip() == "")],
+                               ["wmo", "icao", "noid"], "other"), index=ids.index)
+
+
+def key_class(keys):
+    """station_class of station keys (stnid_lat_lon)."""
+    return station_class(pd.Series(keys, dtype=str).str.rsplit("_", n=2).str[0])
+
+
 def station_key(df):
     return (df["stnid"].astype(str) + "_" + df["latitude"].round(2).astype(str)
             + "_" + df["longitude"].round(2).astype(str))
@@ -1351,7 +1459,8 @@ def matched(cfg, p, step, dates=None):
     rejected. For 2t (and tmax/tmin) the forecasts are corrected from model
     orography to station height with plot.lapse_rate. Stations whose model and
     station elevations are both known and differ by more than plot.max_dz are
-    dropped. This follows the processing of quaver's error_map. The columns
+    dropped, and so are stations whose identifier class (station_class) is not
+    in plot.station_ids (when set). This follows the processing of quaver's error_map. The columns
     dz_<label> hold the model minus station elevation (NaN when unknown).
     For ensembles (several members per file) the forecast column is the
     ensemble mean, and crps_<label> holds the fair CRPS of each pair (the
@@ -1360,6 +1469,10 @@ def matched(cfg, p, step, dates=None):
     frames, units = [], ""
     lapse = float(cfg.plot["lapse_rate"] or 0) if p.param in LAPSE_PARAMS else 0.0
     max_dz = cfg.plot["max_dz"]
+    keep_ids = cfg.plot.get("station_ids")
+    if keep_ids is not None and set(keep_ids) - set(STATION_CLASSES):
+        raise SystemExit(f"plot.station_ids: unknown class(es) {sorted(set(keep_ids) - set(STATION_CLASSES))}, "
+                         f"use {list(STATION_CLASSES)}")
     for d in cfg.dates if dates is None else dates:
         for t in cfg.times:
             vt = valid_time(d, t, step)
@@ -1372,6 +1485,8 @@ def matched(cfg, p, step, dates=None):
             obs, ometa = read_geo(str(of))
             m = obs.assign(key=station_key(obs)).rename(columns={"value_0": "obs", "elevation": "z_obs"})
             m = m.drop_duplicates("key")[["key", "latitude", "longitude", "z_obs", "obs"]]
+            if keep_ids is not None:
+                m = m[key_class(m["key"]).isin(keep_ids).to_numpy()]
             labels = [e["label"] for e in cfg.experiments]
             members = {}
             for lab, files in zip(labels, fcs):
@@ -1453,6 +1568,73 @@ def fair_crps(p, ens, obs):
     return skill - spread / (m * (m - 1))
 
 
+# SEEPS climatology from the STVL database (DODB), as read by Quaver's
+# stationclimatology (climat rodw, 1980-2009, monthly per station). Per
+# station: value_0 p1 (dry probability), value_1 dry/light threshold,
+# value_3 light/heavy threshold, value_4..12 the 3x3 SEEPS error matrix
+# (row = forecast category, column = observed category).
+SEEPS_CLIMATE = "1980-2009"
+SEEPS_P1 = (0.1, 0.85)  # stations used where lower <= p1 < upper (Quaver seeps_filter)
+SEEPS_FETCH = r'''
+import sys, pandas as pd
+from vtb.media import dodb
+out = []
+for mo in range(1, 13):
+    req = dict(table="climatology", parameter="tp", level_type="sfc", level=0, period=86400,
+               reference_datetimes=pd.to_datetime([f"2001-{mo:02d}-15"]), forecast_lengths=[0],
+               model={"class": "od", "stream": "oper", "type": "ec", "climat": "rodw",
+                      "averaged": "monthlystation"},
+               climatology={"climate_period": sys.argv[2], "category": "equitable_categories"})
+    for c in dodb.DODB().read(**req):
+        df = dodb.DODB.container_to_geodf(c)
+        out.append(pd.DataFrame(df).assign(month=mo))
+pd.concat(out, ignore_index=True).to_csv(sys.argv[1], index=False)
+'''
+
+
+def seeps_climatology(cfg):
+    """Station SEEPS climatology of all months (fetched once into the store):
+    one row per stnid and month with p1, t1, t2 and m0..m8."""
+    path = cfg.store / "clim" / f"seeps_tp24_{SEEPS_CLIMATE}.csv"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        log(f"fetching the SEEPS station climatology {SEEPS_CLIMATE} from STVL")
+        subprocess.run(["bash", "-c", f'{UPPER_ENV}; exec python3 -c "$0" "$@"',
+                        SEEPS_FETCH, str(tmp), SEEPS_CLIMATE], check=True)
+        os.replace(tmp, path)
+    c = pd.read_csv(path, dtype={"stnid": str})
+    # several records for a station: keep the one from most observations (as Quaver)
+    c = c.sort_values(["obscount", "enddate"]).drop_duplicates(["stnid", "month"], keep="last")
+    c = c.rename(columns={"value_0": "p1", "value_1": "t1", "value_3": "t2",
+                          **{f"value_{i + 4}": f"m{i}" for i in range(9)}})
+    return c[["stnid", "month", "p1", "t1", "t2"] + [f"m{i}" for i in range(9)]]
+
+
+def add_seeps(df, clim, step, labels):
+    """Columns seeps_<label>: SEEPS of each pair (NaN without a usable
+    climatology), as Quaver's seepsField: values rounded to 0.1 mm, categories
+    dry (<= t1), light, heavy (>= t2), the climatology of the valid month."""
+    vt = pd.to_datetime(df["base"], format="%Y%m%d%H") + pd.Timedelta(hours=step)
+    m = df.assign(stnid=df["key"].str.split("_").str[0], month=vt.dt.month)
+    m = m[["stnid", "month"]].merge(clim, on=["stnid", "month"], how="left")
+    lo, hi = SEEPS_P1
+    ok = ((m["p1"] >= lo) & (m["p1"] < hi)).to_numpy()
+    mat = np.nan_to_num(m[[f"m{i}" for i in range(9)]].to_numpy(float))
+    t1, t2 = m["t1"].to_numpy(float), m["t2"].to_numpy(float)
+
+    def cat(v):
+        v = np.round(np.asarray(v, float), 1)
+        return (v > t1).astype(int) + (v >= t2).astype(int)
+
+    ob = cat(df["obs"])
+    out = df.copy()
+    for lab in labels:
+        idx = cat(df[lab]) * 3 + ob
+        out[f"seeps_{lab}"] = np.where(ok, mat[np.arange(len(m)), idx], np.nan)
+    return out
+
+
 def in_region(df, extent):
     if not extent:
         return df
@@ -1475,6 +1657,10 @@ def station_stats(cfg, p, df, nbases):
         work[f"sq_{lab}"] = err ** 2
         work[f"abs_{lab}"] = err.abs()
         work[f"crps_{lab}"] = df[f"crps_{lab}"]
+    seeps = f"seeps_{labels[0]}" in df
+    if seeps:
+        for lab in labels:
+            work[f"seeps_{lab}"] = df[f"seeps_{lab}"]
     g = work.groupby("key")
     st = g[["latitude", "longitude"]].first()
     st["n"] = g.size()
@@ -1485,7 +1671,12 @@ def station_stats(cfg, p, df, nbases):
         st[f"rmse_{lab}"] = np.sqrt(g[f"sq_{lab}"].mean())
         st[f"mae_{lab}"] = g[f"abs_{lab}"].mean()
         st[f"fcrps_{lab}"] = g[f"crps_{lab}"].mean()
+        if seeps:  # stations without a usable climatology stay NaN
+            st[f"seeps_{lab}"] = g[f"seeps_{lab}"].mean()
     ref = labels[0]
+    if seeps:
+        for lab in labels[1:]:
+            st[f"seepsdiff_{lab}"] = st[f"seeps_{lab}"] - st[f"seeps_{ref}"]
     for lab in labels[1:]:
         st[f"mef_{lab}"] = st[f"bias_{lab}"] - st[f"bias_{ref}"]
         st[f"rmsediff_{lab}"] = st[f"rmse_{lab}"] - st[f"rmse_{ref}"]
@@ -1499,16 +1690,82 @@ def station_stats(cfg, p, df, nbases):
     return st[st["n"] >= min_count].reset_index()
 
 
+_DENSITY_CACHE = {}
+
+
+def station_density_weights(lat, lon, scangle=0.75):
+    """Station-density weights as quaver's spatial_mean_weights=station_density
+    (vtb.geo.station_density_weights): w_i = 1 / sum_j exp(-(d_ij / scangle)^2)
+    over all stations j within 4 * scangle (great-circle distance, degrees),
+    normalised to sum 1. Isolated stations get weight ~1, a station among k
+    close neighbours ~1/k."""
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    key = (float(scangle), hashlib.md5(np.round(np.c_[lat, lon], 5).tobytes()).hexdigest())
+    if key in _DENSITY_CACHE:
+        return _DENSITY_CACHE[key]
+    sc = np.deg2rad(float(scangle))
+    cutoff = 4.0 * sc
+    la, lo = np.deg2rad(lat), np.deg2rad(lon)
+    xyz = np.c_[np.cos(la) * np.cos(lo), np.cos(la) * np.sin(lo), np.sin(la)]
+    dens = np.zeros(len(lat))
+    try:
+        from scipy.spatial import cKDTree
+        tree = cKDTree(xyz)
+        nbrs = tree.query_ball_point(xyz, 2.0 * np.sin(0.5 * cutoff) * (1 + 1e-9))
+    except ImportError:
+        nbrs = None
+    block = 512
+    for i0 in range(0, len(lat), block):
+        rows = xyz[i0:i0 + block]
+        if nbrs is None:  # blocked brute force: fine for O(10^4) stations
+            chord = np.sqrt(np.maximum(((rows[:, None, :] - xyz[None, :, :]) ** 2).sum(-1), 0.0))
+            d = 2.0 * np.arcsin(np.minimum(chord / 2.0, 1.0))
+            k = np.where(d > cutoff, 0.0, np.exp(-(d / sc) ** 2))
+            dens[i0:i0 + block] = k.sum(1)
+        else:
+            for j, idx in enumerate(nbrs[i0:i0 + block]):
+                chord = np.linalg.norm(xyz[idx] - rows[j], axis=1)
+                d = 2.0 * np.arcsin(np.minimum(chord / 2.0, 1.0))
+                dens[i0 + j] = np.exp(-(d[d <= cutoff] / sc) ** 2).sum()
+    w = 1.0 / dens
+    w /= w.sum()
+    _DENSITY_CACHE[key] = w
+    return w
+
+
+def station_weights(cfg, st):
+    """Weights of the stations in the regional scores (plot.spatial_mean_weights)."""
+    mode = str(cfg.plot.get("spatial_mean_weights") or "none").lower()
+    if mode in ("none", "generic"):
+        return np.full(len(st), 1.0 / max(len(st), 1))
+    if mode == "station_density":
+        return station_density_weights(st["latitude"], st["longitude"],
+                                       cfg.plot.get("scangle", 0.75))
+    sys.exit(f"plot.spatial_mean_weights: unknown value {mode!r} (none | station_density)")
+
+
+def wmean(values, w):
+    """Weighted mean over the stations with a valid value."""
+    v = np.asarray(values, dtype=float)
+    ok = np.isfinite(v)
+    return float((v[ok] * w[ok]).sum() / w[ok].sum()) if ok.any() else np.nan
+
+
 def overall_scores(cfg, st):
-    """Regional scores as unweighted means over the station scores, like the
-    domain means of quaver's error_map: RMSE = sqrt(mean of station RMSE^2)."""
+    """Regional scores as means over the station scores, like the domain means
+    of quaver's error_map: RMSE = sqrt(mean of station RMSE^2). The stations are
+    weighted equally or by plot.spatial_mean_weights (e.g. station_density)."""
+    w = station_weights(cfg, st)
     out = {"n": int(st["n"].sum()), "stations": int(len(st))}
     for e in cfg.experiments:
         lab = e["label"]
-        out[lab] = {"bias": float(st[f"bias_{lab}"].mean()),
-                    "rmse": float(np.sqrt((st[f"rmse_{lab}"] ** 2).mean())),
-                    "mae": float(st[f"mae_{lab}"].mean()),
-                    "fcrps": float(st[f"fcrps_{lab}"].mean())}
+        out[lab] = {"bias": wmean(st[f"bias_{lab}"], w),
+                    "rmse": float(np.sqrt(wmean(st[f"rmse_{lab}"] ** 2, w))),
+                    "mae": wmean(st[f"mae_{lab}"], w),
+                    "fcrps": wmean(st[f"fcrps_{lab}"], w)}
+        if f"seeps_{lab}" in st:
+            out[lab]["seeps"] = wmean(st[f"seeps_{lab}"], w)
     return out
 
 
@@ -1516,12 +1773,16 @@ def compute_step(args):
     cfg_path, per, pi, step = args
     cfg = Config(cfg_path)
     p = cfg.params[pi]
-    dates, hour = cfg.plot_periods()[per]
+    dates, hour, classes = cfg.plot_periods()[per]
     df, units = matched(cfg, p, step, dates)
     if df is not None and hour is not None:
         df = df[(df["base"].str[8:].astype(int) + step) % 24 == hour]
+    if df is not None and classes is not None:
+        df = df[key_class(df["key"]).isin(classes).to_numpy()]
     if df is None or df.empty:
         return per, pi, step, None
+    if p.seeps:
+        df = add_seeps(df, seeps_climatology(cfg), step, [e["label"] for e in cfg.experiments])
     res = {"units": units, "bases": sorted(df["base"].unique()), "regions": {}}
     for rname, extent in cfg.plot["regions"].items():
         sub = in_region(df, extent)
@@ -1564,8 +1825,12 @@ METRICS = {
     "fcrps": ("viridis", False, "fair CRPS"),
     "fcrpsdiff": ("RdBu_r", True, "fair CRPS difference vs reference (red = worse)"),
     "fcrpsrel": ("RdBu_r", True, "relative fair CRPS change vs reference (red = worse)"),
+    # only with `seeps: true` (tp24); stations with 0.1 <= p1 < 0.85
+    "seeps": ("viridis", False, "SEEPS (0 = perfect)"),
+    "seepsdiff": ("RdBu_r", True, "SEEPS difference vs reference (red = worse)"),
 }
 PERCENT = {"rmserel", "fcrpsrel"}
+UNITLESS = {"seeps", "seepsdiff"}
 NAMES = {"mef": "MEF", "rmserel": "RMSE change", "fcrps": "FCRPS",
          "fcrpsdiff": "FCRPS diff", "fcrpsrel": "FCRPS change"}
 OROG = ("BrBG_r", "model minus station elevation")  # step-independent map orog_<label>.png  # metrics plotted in % rather than the parameter's units
@@ -1661,6 +1926,7 @@ def draw_scores(path, p, steps, scores, labels, units, region, dpi, ensemble=Fal
     import matplotlib.pyplot as plt
 
     ref = labels[0]
+    seeps = any("seeps" in sc[ref] for sc in scores.values())
     panels = [("bias", f"Bias [{units}]"), ("rmse", f"RMSE [{units}]"), ("mae", f"MAE [{units}]")]
     if len(labels) > 1:
         panels.append(("mef", f"Mean bias difference vs {ref} [{units}]"))
@@ -1670,6 +1936,10 @@ def draw_scores(path, p, steps, scores, labels, units, region, dpi, ensemble=Fal
         panels.append(("rmserel", f"RMSE change vs {ref} [%]"))
         if ensemble:
             panels.append(("fcrpsrel", f"FCRPS change vs {ref} [%]"))
+    if seeps:
+        panels.append(("seeps", "SEEPS [-]"))
+        if len(labels) > 1:
+            panels.append(("seepsdiff", f"SEEPS difference vs {ref} [-]"))
     ncols = 3 if len(panels) > 4 else len(panels)
     nrows = -(-len(panels) // ncols)
     fig, axs = plt.subplots(nrows, ncols, figsize=(4.4 * ncols, 4.0 * nrows), sharex=True,
@@ -1680,7 +1950,7 @@ def draw_scores(path, p, steps, scores, labels, units, region, dpi, ensemble=Fal
     colors = {lab: SERIES[i % len(SERIES)] for i, lab in enumerate(labels)}
 
     def get(s, lab, m):
-        return scores[s][lab][m] if s in scores else np.nan
+        return scores[s][lab].get(m, np.nan) if s in scores else np.nan
 
     for ax, (m, ylabel) in zip(axs, panels):
         for lab in labels:
@@ -1692,10 +1962,14 @@ def draw_scores(path, p, steps, scores, labels, units, region, dpi, ensemble=Fal
                 if lab == ref:
                     continue
                 y = [get(s, lab, "bias") - get(s, ref, "bias") for s in steps]
+            elif m.endswith("diff"):
+                if lab == ref:
+                    continue
+                y = [get(s, lab, m[:-4]) - get(s, ref, m[:-4]) for s in steps]
             else:
                 y = [get(s, lab, m) for s in steps]
             ax.plot(steps, y, marker="o", ms=3.5, lw=1.6, color=colors[lab], label=lab)
-        if m in ("bias", "mef") or m.endswith("rel"):
+        if m in ("bias", "mef") or m.endswith("rel") or m.endswith("diff"):
             ax.axhline(0, color="0.3", lw=0.8)
         if m.endswith("rel"):
             lo, hi = ax.get_ylim()
@@ -1738,6 +2012,8 @@ def stage_plot(cfg, args):
         periods = list(pperiods)
         tasks = [(str(cfg.path), per, pi, s) for per in periods
                  for pi, p in enumerate(cfg.params) for s in cfg.steps_for(p)]
+        if any(p.seeps for p in cfg.params):
+            seeps_climatology(cfg)  # fetched once here, not by each worker
         log(f"computing statistics for {len(tasks)} period/parameter/step combinations")
         results = {per: defaultdict(dict) for per in periods}  # [period][param index][step]
         with Pool(nproc) as pool:
@@ -1752,8 +2028,9 @@ def stage_plot(cfg, args):
                     "regions": list(cfg.plot["regions"]), "metrics": {}, "periods": {},
                     "generated": dt.datetime.now().strftime("%Y-%m-%d %H:%M")}
         for per in periods:
-            d, hour = pperiods[per]
-            dates = f"{ymd(d[0])}-{ymd(d[-1])}" + ("" if hour is None else f", valid {hour:02d} UTC only")
+            d, hour, classes = pperiods[per]
+            dates = (f"{ymd(d[0])}-{ymd(d[-1])}" + ("" if hour is None else f", valid {hour:02d} UTC only")
+                     + ("" if classes is None else f", stations with {'/'.join(classes)} identifiers only"))
             manifest["periods"][per] = {"dates": dates, "params": {}}
         for m, (_, div, desc) in cfg.metrics.items():
             if cfg.ensemble and m in ("bias", "rmse", "mae"):
@@ -1816,7 +2093,8 @@ def stage_plot(cfg, args):
                                       else f" vs {ref}" if m in PERCENT else "")
                                 name = NAMES.get(m, m.upper().replace("DIFF", " diff"))
                                 title = f"{p.label} {name}   {lab}{vs}   T+{s}h"
-                                subtitle = f"{ptag}{rname} · {len(bases)} forecasts {span} · {len(st)} stations"
+                                nst = int(np.isfinite(st[col]).sum())
+                                subtitle = f"{ptag}{rname} · {len(bases)} forecasts {span} · {nst} stations"
                                 note = map_note(m, st[col].values)
                                 sig = hashlib.md5(json.dumps(
                                     [STYLE, dpi, bases, len(st), float(st[col].sum()), vmin, vmax,
@@ -1826,7 +2104,8 @@ def stage_plot(cfg, args):
                                         lon=st.longitude.values, lat=st.latitude.values,
                                         val=st[col].values, title=title, subtitle=subtitle, note=note,
                                         cmap=cmap, vmin=vmin, vmax=vmax, extent=extent,
-                                        label=f"{desc} [{'%' if m in PERCENT else units}]", dpi=dpi)))
+                                        label=f"{desc} [{'%' if m in PERCENT else '-' if m in UNITLESS else units}]",
+                                        dpi=dpi)))
                         if cfg.plot["daily_maps"]:
                             jobs += daily_jobs(p, s, rname, extent, res[s]["regions"][rname]["daily"],
                                                units, dpi, want, labels, rdir / "daily")
@@ -1861,6 +2140,8 @@ def stage_plot(cfg, args):
                                 label=f"{OROG[1]} [m]", dpi=dpi)))
                     path = rdir / "scores.png"
                     region_title = rname if per == "all" else f"{rname} – {per}"
+                    if str(cfg.plot.get("spatial_mean_weights") or "none").lower() == "station_density":
+                        region_title += " (station-density weighted)"
                     sig = hashlib.md5(json.dumps([STYLE, dpi, region_title, scores],
                                                  sort_keys=True, default=str).encode()).hexdigest()
                     if want(path, sig):

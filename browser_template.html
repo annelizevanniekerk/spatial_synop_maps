@@ -90,6 +90,10 @@ const VIEWS = [
     ["fcrpsdiff", `FCRPS difference vs ${REF}`, OTHERS],
     ["fcrpsrel", `Relative FCRPS change vs ${REF} (%)`, OTHERS],
   ] : []),
+  ...("seeps" in M.metrics ? [
+    ["seeps", "SEEPS", EXPS],
+    ["seepsdiff", `SEEPS difference vs ${REF}`, OTHERS],
+  ] : []),
   ["orog", "Model − station height", null],
   ["scores", "Scores vs step", null],
   ["daily", "Single forecasts", null],
@@ -110,6 +114,7 @@ function params() { return M.periods[$("period").value]?.params ?? {}; }
 function regionInfo() { return params()[$("param").value]?.regions[$("region").value]; }
 function steps() { return regionInfo()?.steps ?? []; }
 function step() { return steps()[+$("step").value]; }
+function hasSeeps() { return Object.values(regionInfo()?.scores ?? {}).some(sc => sc[REF]?.seeps !== undefined); }
 
 function refreshControls() {
   fill($("period"), PERIODS.map(k => [k, `${k} (${M.periods[k].dates})`]), state.period);
@@ -119,7 +124,8 @@ function refreshControls() {
   if (!p) { $("figs").innerHTML = '<div class="missing">No data plotted yet.</div>'; return false; }
   fill($("region"), Object.keys(p.regions).map(r => [r, r]), state.region);
   const views = VIEWS.filter(v => (v[0] !== "daily" || regionInfo().daily.length)
-    && (v[0] !== "orog" || regionInfo().orog?.length));
+    && (v[0] !== "orog" || regionInfo().orog?.length)
+    && (!v[0].startsWith("seeps") || hasSeeps()));
   fill($("view"), views.map(([v, t]) => [v, t]), state.view);
   const daily = regionInfo().daily;
   fill($("base"), daily.map(b => [b, `${b.slice(0,4)}-${b.slice(4,6)}-${b.slice(6,8)} ${b.slice(8)}z`]), state.base);
@@ -172,7 +178,8 @@ function renderTable(p, s) {
   const sc = regionInfo().scores[s];
   if (!sc) { $("table").innerHTML = ""; return; }
   const units = p.units ? ` [${p.units}]` : "";
-  const metrics = ENS ? ["bias", "rmse", "mae", "fcrps"] : ["bias", "rmse", "mae"];
+  const SE = sc[REF].seeps !== undefined;
+  const metrics = ["bias", "rmse", "mae", ...(ENS ? ["fcrps"] : []), ...(SE ? ["seeps"] : [])];
   const relCell = (e, m) => {
     if (e === REF) return "<td>–</td>";
     const rel = 100 * (sc[e][m] / sc[REF][m] - 1);
@@ -190,7 +197,7 @@ function renderTable(p, s) {
     return `<tr><td>${e}${e === REF ? " (ref)" : ""}</td>${cells}${rels}</tr>`;
   }).join("");
   $("table").innerHTML = `<table><thead><tr><th>T+${s}h · ${sc.n} pairs · ${sc.stations} stations</th>
-    <th>Bias${units}</th><th>RMSE${units}</th><th>MAE${units}</th>${ENS ? `<th>FCRPS${units}</th>` : ""}<th>RMSE vs ${REF}</th>${ENS ? `<th>FCRPS vs ${REF}</th>` : ""}</tr></thead><tbody>${rows}</tbody></table>`;
+    <th>Bias${units}</th><th>RMSE${units}</th><th>MAE${units}</th>${ENS ? `<th>FCRPS${units}</th>` : ""}${SE ? "<th>SEEPS</th>" : ""}<th>RMSE vs ${REF}</th>${ENS ? `<th>FCRPS vs ${REF}</th>` : ""}</tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function move(d) {

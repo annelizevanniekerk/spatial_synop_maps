@@ -1,7 +1,7 @@
 # Example configuration for synop_maps.py
 # Copy this file, edit it, then:  python3 synop_maps.py submit my_config.yaml
 
-name: CONVX2_APT_waves_10m_wind_latest            # used for job names and the default workdir
+name: CONVX2_APT_waves_10m_wind_00UTC_ODB            # used for job names and the default workdir
 # workdir: /scratch/$USER/synop_maps/my_comparison   # default: ./runs/<name>
 # store: $PERM/synop_store     # geopoint files shared by all configs; default: ./store
 collocate: local              # vino: upload to / download from VINO
@@ -18,8 +18,8 @@ collocate: local              # vino: upload to / download from VINO
 periods:
   DJF: 20241201/to/-/by/1
   JJA: 20240601/to/-/by/1
-times: [0, 12]
-steps: 24/to/240/by/24
+times: [0]
+steps: 12/to/240/by/12
 
 # Parameters (MARS names as understood by vino_genfc / vino_getgeo).
 # Accumulated / extreme parameters need a period in hours; steps shorter than
@@ -28,8 +28,9 @@ parameters:
   - param: 2t
   - param: 10ff
   # - param: msl
-  - param: tp
-    period: 24
+  # - param: tp
+  #   period: 24
+  #   seeps: true
 
 # Experiments. The FIRST one is the reference for difference maps.
 #   upload: true   -> missing dates are pushed to VINO with vino_genfc
@@ -47,6 +48,8 @@ experiments:
     type: fc
     anoffset: 9
     upload: true
+    database: mars+fdb
+
   - label: CONVX2_APT_waves_10m_wind
     class: rd
     stream: lwda           # lwda for experiments run with the long window DA
@@ -54,6 +57,7 @@ experiments:
     type: fc
     anoffset: 9          # needed for stream lwda
     upload: true
+    database: mars+fdb
   - label: CONVX2
     class: rd
     stream: lwda
@@ -61,6 +65,8 @@ experiments:
     anoffset: 9
     type: fc
     upload: true
+    database: mars+fdb
+
   - label: APT_v3.3
     class: rd
     stream: lwda
@@ -68,8 +74,28 @@ experiments:
     anoffset: 9
     type: fc
     upload: true    
+    database: mars+fdb
 
-sources: [synop]               # VINO observation sources
+  - label: 10m_wind
+    class: rd
+    stream: lwda
+    expver: {DJF: jbdu, JJA: jcpx}
+    anoffset: 9
+    type: fc
+    upload: true
+    database: mars+fdb
+
+observations:
+  source: mars
+  mars: {class: od, expver: 1, stream: lwda, type: ofb, obsgroup: conv}
+  window: [-3, 9]
+  window_times: [0, 12]
+  tolerance: 30
+  obstype: [1]
+  codetype: null
+  active_only: false
+
+# sources: [mars]               # VINO observation sources
 interpolation: nearest_point   # nearest_point | nearest_land_point | nearest_sea_point
 chunk_size: 15                 # dates per vino_genfc / vino_getgeo call
 parallel: 4                    # concurrent vino_genfc / vino_getgeo calls
@@ -84,10 +110,11 @@ plot:
     global: null
     europe: [-25, 45, 33, 72]
     north_america: [-170, -50, 15, 75]
-
+  spatial_mean_weights: station_density   # default: none (all stations count the same)
+  scangle: 0.75
+  
   min_fraction: 0.5            # station needs valid pairs for >= this fraction of forecasts
   daily_maps: false            # also draw maps for every single forecast (many images!)
-  valid_hours: [0, 12]         # extra periods (e.g. DJF_00UTC) with only forecasts valid at these UTC hours
   processes: 4                 # used when not running under slurm
   dpi: 150
   lapse_rate: 0.0065           # K/m, corrects 2t forecasts to station height (0 = off)

@@ -65,6 +65,9 @@ steps: 24/to/240/by/24
 parameters:
   - param: 2t
   - {param: tp, period: 24}        # accumulations need a period; steps < period are dropped
+  # add `seeps: true` to tp/period 24 for SEEPS maps and scores: Quaver's station
+  # climatology (STVL, 1980-2009, valid month; fetched once into store/clim),
+  # stations with 0.1 <= p1 < 0.85 only, values rounded to 0.1 mm as in Quaver
 experiments:                       # FIRST experiment = reference for difference maps
   - {label: oper, class: od, stream: oper,  expver: "0001", type: fc, upload: false}
   - {label: exp1, class: rd, stream: lwda,  expver: abcd,   type: fc, anoffset: 9}
@@ -75,6 +78,10 @@ plot:
 * `database: fdb` (per experiment) retrieves the forecasts from an alternative
   MARS database, e.g. experiments whose data is still in the FDB only. Needs
   explicit end dates (MARS cannot list such a database).
+* `database: mars+fdb` (per experiment) takes each date from MARS and, where
+  MARS does not have it (yet), from the FDB, e.g. an experiment whose older
+  dates are archived and whose recent ones are still in the FDB only. Open end
+  dates (`-`) use the dates found in either.
 * `store` (top level) sets the shared data directory. Environment variables
   are expanded, e.g. `store: $PERM/synop_store`.
 * `collocate: vino | local` (top level default, can be overridden per
@@ -162,9 +169,13 @@ uploaded or downloaded; observations still come from VINO through
   reference**. As in quaver's
   `error_map`, a station is used only when it has valid pairs for at least
   `plot.min_fraction` (default 0.5) of the forecasts.
-* Regional scores (scores.png, browser table) are unweighted means of the
-  station scores, as in `error_map`: bias and MAE are station means, RMSE is
-  sqrt(mean of station RMSE²).
+* Regional scores (scores.png, browser table) are weighted means of the
+  station scores: bias and MAE are station means, RMSE is
+  sqrt(mean of station RMSE²). By default (`plot.spatial_mean_weights:
+  station_density`, as quaver's `spatial_mean_weights = "station_density"`)
+  the stations are weighted by 1 / Σ exp(−(d/scangle)²) over their neighbours
+  within 4·scangle (`plot.scangle`, default 0.75°), so each station of a dense
+  network counts less; `none` weights all stations equally, as in `error_map`.
 * Observations outside plausible ranges are rejected as in `error_map`
   (2t/tmax/tmin −100…60 °C, tp 0…900 mm, 10ff 0…50 m/s, tcc 0…100 %), and
   station elevations above 9000 m are treated as missing.
@@ -181,6 +192,16 @@ uploaded or downloaded; observations still come from VINO through
   by more than `plot.max_dz` are excluded (stations without an elevation are
   kept, as in `error_map --orography_filter_threshold`); `max_dz: null`
   switches this off.
+* Stations are classed by their identifier: `wmo` (numeric WMO block/station
+  number), `icao` (4 letters, METAR), `noid` (no identifier; the ODB gives
+  these reports `_` + a hash, e.g. dense national networks such as most of the
+  Italian and Balkan stations, which often record much weaker winds than the
+  WMO stations) and `other` (ships, mobile stations). `plot.station_ids`
+  (e.g. `[wmo, icao]`) keeps only those classes in all statistics; the default
+  `null` keeps all. `plot.station_groups` adds extra periods with only some
+  classes, alongside the full set, e.g.
+  `station_groups: {wmo: [wmo], noid: [noid]}` gives `JJA_wmo` and `JJA_noid`
+  (and `JJA_00UTC_wmo` etc. with `valid_hours`).
 * `orog_<experiment>.png` maps show the model minus station elevation per
   station (brown = model surface above the station), over the stations
   verified at any step for that parameter, region and period. They do not
@@ -359,12 +380,12 @@ e.g. `expver: {DJF: abcd, JJA: efgh}`. Every period must be listed.
 
 ## Observations from MARS feedback
 
-The surface observations can come from the feedback (ODB) of an assimilation in
-MARS instead of VINO, using all of its stations:
+By default the surface observations come from the feedback (ODB) of an
+assimilation in MARS, using all of its stations:
 
 ```yaml
 observations:
-  source: mars
+  source: mars                 # default; vino: observations from VINO instead
   mars: {class: od, expver: 1, stream: lwda, type: ofb, obsgroup: conv}
 ```
 
@@ -407,11 +428,20 @@ observations:
     upper_air: {obstype: [5], codetype: null, tolerance: 90}
   ```
 * Reading the feedback needs `pyodc` (in the `python3` module).
+* A parameter can override the observation source with `obs: vino` (or
+  `obs: mars`), e.g. tp, which is not in the feedback, from VINO SYNOP
+  observations next to 2t from MARS:
+
+  ```yaml
+  parameters:
+    - param: 2t
+    - {param: tp, period: 24, obs: vino}
+  ```
 
 ## Upper-air (TEMP) parameters
 
-Radiosonde observations from the VINO `temp` data set (or, with
-`observations.source: mars`, from the MARS feedback, see above) can be
+Radiosonde observations from the MARS feedback (default, see above; or, with
+`observations.source: vino`, from the VINO `temp` data set) can be
 verified like the SYNOP parameters. Give the pressure levels (hPa) of a parameter:
 
 ```yaml
