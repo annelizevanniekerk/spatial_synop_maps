@@ -380,12 +380,13 @@ e.g. `expver: {DJF: abcd, JJA: efgh}`. Every period must be listed.
 
 ## Observations from MARS feedback
 
-By default the surface observations come from the feedback (ODB) of an
-assimilation in MARS, using all of its stations:
+By default the surface observations come from VINO (`sources`, default
+`[synop]`). They can instead come from the feedback (ODB) of an assimilation in
+MARS, using all of its stations:
 
 ```yaml
 observations:
-  source: mars                 # default; vino: observations from VINO instead
+  source: mars                 # default: vino
   mars: {class: od, expver: 1, stream: lwda, type: ofb, obsgroup: conv}
 ```
 
@@ -440,8 +441,8 @@ observations:
 
 ## Upper-air (TEMP) parameters
 
-Radiosonde observations from the MARS feedback (default, see above; or, with
-`observations.source: vino`, from the VINO `temp` data set) can be
+Radiosonde observations from the VINO `temp` data set (or, with
+`observations.source: mars`, from the MARS feedback, see above) can be
 verified like the SYNOP parameters. Give the pressure levels (hPa) of a parameter:
 
 ```yaml

@@ -27,13 +27,9 @@ steps: 24/to/240/by/24
 parameters:
   - param: 2t
   - param: 10ff
-  # Not in the MARS feedback (observations.source: mars, the default): take
-  # these from VINO SYNOP observations with `obs: vino`.
   - param: msl
-    obs: vino
   - param: tp
     period: 24
-    obs: vino
   # Upper-air parameters at TEMP (radiosonde) stations: t, z, ff, dd, td on
   # pressure levels in hPa. They are always collocated locally from MARS
   # (needs upper_air.grid), for every experiment including operations.
@@ -77,23 +73,23 @@ experiments:
   #   anoffset: 9
   #   type: fc
 
-sources: [synop]               # VINO observation sources (observations.source: vino, obs: vino)
+sources: [synop]               # VINO observation sources, e.g. [synop, hdobs]
 interpolation: nearest_point   # nearest_point | nearest_land_point | nearest_sea_point
 
-# Surface observations: from the MARS feedback of an assimilation (ODB, type
-# ofb; default) or from VINO. With mars, the forecasts of all experiments are
-# picked at the feedback stations in the collocate stage (no VINO involved).
-# Available parameters: 2t, 2d, 10ff, 10dd, 10u, 10v (interpolation: nearest_point);
-# others need `obs: vino` (see parameters above).
-observations:
-  source: mars                 # mars | vino
-  mars: {class: od, expver: 1, stream: lwda, type: ofb, obsgroup: conv}
-  window: [-3, 9]              # hours of the window of each analysis time (lwda 12h 4D-Var)
-  window_times: [0, 12]
-  tolerance: 30                # minutes around the valid hour; the closest report is used
-  obstype: [1]                 # 1 = SYNOP (land, ship, METAR)
-  codetype: null               # e.g. [11, 14]: land SYNOP only
-  active_only: false           # only observations active in the assimilation
+# Surface observations: from VINO (default, data sets in `sources`) or from the
+# MARS feedback of an assimilation (ODB, type ofb). With mars, the forecasts of
+# all experiments are picked at the feedback stations in the collocate stage (no
+# VINO involved). Available parameters: 2t, 2d, 10ff, 10dd, 10u, 10v
+# (interpolation: nearest_point); others then need `obs: vino` per parameter.
+# observations:
+#   source: mars               # vino | mars
+#   mars: {class: od, expver: 1, stream: lwda, type: ofb, obsgroup: conv}
+#   window: [-3, 9]            # hours of the window of each analysis time (lwda 12h 4D-Var)
+#   window_times: [0, 12]
+#   tolerance: 30              # minutes around the valid hour; the closest report is used
+#   obstype: [1]               # 1 = SYNOP (land, ship, METAR)
+#   codetype: null             # e.g. [11, 14]: land SYNOP only
+#   active_only: false         # only observations active in the assimilation
 chunk_size: 15                 # dates per vino_genfc / vino_getgeo call
 parallel: 4                    # concurrent vino_genfc / vino_getgeo calls
 

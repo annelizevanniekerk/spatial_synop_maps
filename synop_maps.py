@@ -13,7 +13,7 @@ Stages (each can be rerun safely; work already done is skipped):
                              (always local, for every experiment)
     download  vino_getgeo  : VINO -> local geopoint files (obs + forecasts);
                              TEMP observations with vino_upper.py;
-                             with observations.source: mars (default) the SYNOP
+                             with observations.source: mars the SYNOP
                              observations come from MARS feedback (type ofb)
                              and the forecasts are picked at its stations by
                              vino_upper.py in the collocate stage
@@ -91,7 +91,7 @@ DEFAULTS = {
     "times": [0],
     "sources": ["synop"],
     "observations": {
-        "source": "mars",  # mars | vino: surface observations from MARS feedback (ODB) or VINO
+        "source": "vino",  # vino | mars: surface observations from VINO (sources) or MARS feedback (ODB)
         # MARS feedback request (source: mars); time and date are added per window
         "mars": {"class": "od", "expver": 1, "stream": "lwda", "type": "ofb", "obsgroup": "conv"},
         "window": [-3, 9],  # assimilation window of each `window_times` analysis, in hours
